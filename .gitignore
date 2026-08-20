@@ -3,3 +3,5 @@ How to Install XAMPP and WordPress Locally on Windows PC.html
 How to Install XAMPP and WordPress Locally on Windows PC_files/
 *.lnk
 .DS_Store
+
+# Project-level ignores are in apartments-agent-from-scratch/.gitignore
