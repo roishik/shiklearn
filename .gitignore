@@ -1,0 +1,5 @@
+# Stray files that predate this repo and are not part of any project
+How to Install XAMPP and WordPress Locally on Windows PC.html
+How to Install XAMPP and WordPress Locally on Windows PC_files/
+*.lnk
+.DS_Store
