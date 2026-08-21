@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" type="image/png" href="/static/favicon.png">
-<title>Airport Investment Intelligence</title>
+<title>Israel Home-Buying Intelligence</title>
 <style>
 /* ── Design tokens ─────────────────────────────────────────────────────
    A light off-white canvas carrying two deliberately different surfaces,
@@ -67,11 +67,22 @@
   --danger-wash: #FEE9E9;
   --danger-on-dark: #F87171;
 
+  /* "Arial Hebrew" and "Noto Sans Hebrew" are inserted ahead of the
+     Latin-only faces (Segoe UI, Helvetica Neue, Arial) rather than after
+     them: those Latin faces are matched first for Latin text regardless
+     of list order, but for a run of Hebrew characters the browser walks
+     the list looking for the first face that actually has Hebrew glyphs,
+     so a Hebrew-capable name has to appear before a same-priced
+     Hebrew-less one to be preferred over the OS's own fallback pick.
+     Arial Hebrew ships with macOS; Noto Sans Hebrew covers Linux/Windows
+     where it's installed and is a no-op where it isn't (falls through to
+     -apple-system/Segoe UI/system-ui, which render Hebrew adequately on
+     their native platforms even without an explicit Hebrew face). */
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
-          "Segoe UI Variable Text", "Segoe UI", Inter, system-ui,
-          "Helvetica Neue", Helvetica, Arial, sans-serif;
+          "Segoe UI Variable Text", "Segoe UI", "Arial Hebrew", "Noto Sans Hebrew",
+          Inter, system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas,
-          "Liberation Mono", monospace;
+          "Noto Sans Mono", "Liberation Mono", monospace;
 
   --r-lg: 16px;
   --r-md: 12px;
@@ -337,6 +348,15 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
   border-radius: var(--r-sm);
   padding: 0.1rem 0.35rem;
 }
+.empty-state .example-list {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.empty-state .example-list li { line-height: 1.6; }
 
 /* ── Chat messages ────────────────────────────────────────────────────── */
 .msg { margin-bottom: 1.25rem; }
@@ -355,6 +375,19 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 
 .msg .content { font-size: 0.93rem; line-height: 1.62; color: var(--ink); overflow-wrap: break-word; }
+
+/* A message detected as predominantly Hebrew (see isPredominantlyHebrew in
+   the inline script) gets ITS bubble — not the page — flipped to RTL. The
+   more common case, Hebrew place names inline inside an English sentence,
+   does NOT hit this rule; those stay in an LTR bubble and get individually
+   wrapped in <bdi> instead (see wrapHebrewRuns), which is the correct tool
+   for an isolated foreign-direction run rather than flipping the whole
+   paragraph. */
+.msg .content[dir="rtl"] { text-align: right; }
+/* <bdi> already isolates direction per the HTML5 spec with no CSS needed;
+   this only keeps an inline Hebrew run from ever stretching across a line
+   break in a way that would separate it from the punctuation next to it. */
+.msg .content bdi { unicode-bidi: isolate; }
 
 /* The user's own turn is a deep charcoal container, right-aligned: the
    one place on this light canvas where the dark surface means "this came
@@ -503,7 +536,18 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
   color: var(--on-dark-soft);
   word-break: break-word;
   min-width: 0;
+  direction: ltr;
+  unicode-bidi: embed;
 }
+/* This viewport stays dir="ltr" (set on #tool-log in the markup) even
+   though raw tool arguments/results routinely contain Hebrew locality and
+   neighborhood names — the JSON braces, keys, and commas need to read
+   left-to-right for the structure to be legible at all. Hebrew string
+   VALUES inside it still need to render correctly, not reversed, so each
+   one gets its own isolated, auto-detected direction rather than
+   inheriting the container's forced LTR — unicode-bidi: embed still lets
+   glyph order flip correctly within an RTL run, it only stops that run
+   from reordering anything outside itself. */
 .tool-entry pre {
   white-space: pre-wrap;
   word-break: break-word;
@@ -518,7 +562,13 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
   color: var(--on-dark-soft);
   max-height: 240px;
   overflow-y: auto;
+  direction: ltr;
+  unicode-bidi: embed;
 }
+/* Hebrew JSON string values (.jv, from highlightJSON) get their own
+   bidi isolation so a Hebrew value doesn't drag the ": " or trailing
+   comma out of LTR order along with it. */
+.tool-entry pre .jv { unicode-bidi: isolate; }
 .tool-entry.error pre { color: var(--danger-on-dark); border-color: rgba(248, 113, 113, 0.3); }
 .jk { color: #93A9CE; }
 .jv { color: #A5D6A7; }
@@ -707,8 +757,8 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
 <main>
   <header>
     <p class="eyebrow">Decision support · deterministic scoring</p>
-    <h1>Airport Investment Intelligence</h1>
-    <p class="tagline">Ask about expansion candidates, congestion, or unmet demand. Every score is computed by code you can read — the model only explains it.</p>
+    <h1>Israel Home-Buying Intelligence</h1>
+    <p class="tagline">Ask which Israeli localities or neighborhoods are good value to buy a home in, or compare two head-to-head. Every score is computed by code you can read — the model only explains it.</p>
     <div class="status-row">
       <div id="status" class="chip" role="status" aria-live="polite">loading</div>
       <button id="voice-toggle" class="chip" type="button" aria-pressed="false" title="Read the agent's replies aloud using your browser's own speech synthesis">Voice replies · off</button>
@@ -723,7 +773,15 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
         <span id="step-tag" class="step-tag" role="status" aria-live="polite" hidden></span>
       </div>
       <div id="chat" class="card-body" role="log" aria-live="polite" aria-relevant="additions">
-        <div id="chat-empty" class="empty-state">Ask about an airport, a region, or a head-to-head comparison. <span class="k">Compare LAX and SNA congestion levels.</span></div>
+        <div id="chat-empty" class="empty-state">Ask about a locality, a region, or a head-to-head comparison — in English or Hebrew.
+          <ul class="example-list">
+            <li><span class="k">Which places within 30 km of Tel Aviv are good value for a family with a 2.5M ₪ budget?</span></li>
+            <li><span class="k">Compare Kfar Saba and Ra'anana</span> — or an ambiguous name like Modi'in.</li>
+            <li><span class="k">What share of Tel Aviv's neighborhoods are above the city median price?</span></li>
+            <li><span class="k">What monthly income do I need to buy a median 4-room flat in Be'er Sheva, and why?</span></li>
+            <li><span class="k" dir="rtl">השווה בין רעננה לכפר סבא</span> — Hebrew works too.</li>
+          </ul>
+        </div>
       </div>
     </section>
 
@@ -732,7 +790,7 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
         <span class="card-title">Reasoning trace</span>
         <span id="live-dot" class="live-dot" aria-hidden="true"></span>
       </div>
-      <div id="tool-log" class="card-body">
+      <div id="tool-log" class="card-body" dir="ltr">
         <div id="tool-log-empty" class="empty-state">No tool calls yet. Every ranking, comparison, and figure here traces back to a real function call — never a guess.</div>
         <div id="tool-log-entries"></div>
       </div>
@@ -740,7 +798,7 @@ button.chip:disabled { opacity: 0.45; cursor: not-allowed; }
   </div>
 
   <div id="composer">
-    <input id="input" type="text" placeholder="Which airports in New England are strong candidates for terminal expansion?" autofocus autocomplete="off" aria-label="Ask a question" />
+    <input id="input" type="text" placeholder="Which places within 30 km of Tel Aviv are good value for a 2.5M ₪ budget?" autofocus autocomplete="off" aria-label="Ask a question" />
     <button id="mic" class="icon-btn" type="button" title="Speak your question" aria-label="Speak your question">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
@@ -817,6 +875,13 @@ if (!('speechSynthesis' in window)) {
 function startRecognition() {
   if (!SpeechRecognitionCtor || recognizing) return;
   recognition = new SpeechRecognitionCtor();
+  // Deliberately English-only: voice is out of scope for Hebrew in this
+  // build. Hebrew is fully supported as typed text (the agent, tools, and
+  // dataset all handle it), but no Hebrew speech-recognition model is
+  // wired up here, so forcing 'he-IL' would just mean every Hebrew
+  // utterance mis-transcribes through an English-tuned recognizer. Keep
+  // 'en-US' rather than leaving it unset so behavior doesn't silently
+  // depend on the browser's own locale.
   recognition.lang = 'en-US';
   recognition.interimResults = true;
   recognition.continuous = true;
@@ -881,6 +946,71 @@ function highlightJSON(jsonText) {
     .replace(/: (true|false|null)/g, ': <span class="jb">$1</span>');
 }
 
+// ── Hebrew / RTL ─────────────────────────────────────────────────────
+// The page stays English-first (html lang="en", no page-level dir flip —
+// Roi was explicit the UI itself doesn't change), but Hebrew shows up in
+// three places: a user message typed entirely in Hebrew, a Hebrew place
+// name sitting inline inside an English sentence in the agent's reply,
+// and Hebrew string values inside the raw tool-call JSON (handled in CSS
+// above via .tool-entry pre / .jv). This handles the first two.
+const HEBREW_CHAR_RE = /[\u0590-\u05FF]/g;
+// A run of Hebrew letters, tolerating single embedded spaces, hyphens, or
+// apostrophes so "בן גוריון" or "תל-אביב" isolate as one run rather than
+// three, but a run never crosses a comma, parenthesis, or other
+// structural punctuation — those belong to the surrounding English
+// sentence, not the name.
+const HEBREW_RUN_RE = /[\u0590-\u05FF]+(?:[ '’-][\u0590-\u05FF]+)*/g;
+
+// A message counts as "predominantly Hebrew" when Hebrew letters are the
+// majority of the letters in it — not the majority of all characters,
+// which would be skewed by spaces, digits, and punctuation in either
+// direction. Latin letters are the only other thing counted, so a
+// message that is mostly numbers/JSON/punctuation with one Hebrew word
+// does not flip (that is exactly the "inline name" case, handled by
+// wrapHebrewRuns instead).
+function isPredominantlyHebrew(text) {
+  const hebrew = (text.match(HEBREW_CHAR_RE) || []).length;
+  if (!hebrew) return false;
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  return hebrew > latin;
+}
+
+// Wraps each run of Hebrew characters found in text nodes under `root` in
+// a <bdi> element. <bdi> is the HTML5 element built exactly for this: an
+// isolated span whose direction is auto-detected from its own content,
+// so a Hebrew name embedded in an LTR sentence renders right-to-left
+// internally without dragging the sentence's punctuation out of order
+// (the classic bug: "Kfar Sava (כפר סבא)," rendering with the comma or
+// closing paren jumping to the wrong side). Operates on already-rendered
+// DOM text nodes via createTextNode/textContent, so it introduces no new
+// innerHTML sink — the escape-first invariant in markdown.js is
+// untouched, this only re-parents text that is already safe.
+function wrapHebrewRuns(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const targets = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    HEBREW_RUN_RE.lastIndex = 0;
+    if (HEBREW_RUN_RE.test(node.nodeValue)) targets.push(node);
+  }
+  for (const textNode of targets) {
+    const value = textNode.nodeValue;
+    HEBREW_RUN_RE.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m;
+    while ((m = HEBREW_RUN_RE.exec(value))) {
+      if (m.index > last) frag.appendChild(document.createTextNode(value.slice(last, m.index)));
+      const bdi = document.createElement('bdi');
+      bdi.textContent = m[0];
+      frag.appendChild(bdi);
+      last = m.index + m[0].length;
+    }
+    if (last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
 function addMessage(role, text) {
   chatEmptyEl.style.display = 'none';
   const div = document.createElement('div');
@@ -890,12 +1020,19 @@ function addMessage(role, text) {
     : 'You';
   div.innerHTML = `<div class="role">${label}</div><div class="content"></div>`;
   const content = div.querySelector('.content');
+  const hebrewDominant = isPredominantlyHebrew(text);
+  // A whole-message-Hebrew bubble (a Hebrew question, or in principle a
+  // Hebrew answer) gets ITS bubble flipped to RTL. Everything else stays
+  // LTR — including a reply that just happens to open with a Hebrew
+  // name — and gets Hebrew runs isolated individually instead, below.
+  content.setAttribute('dir', hebrewDominant ? 'rtl' : 'ltr');
   // Only the agent's own replies are treated as markdown. The user's text
   // goes in via textContent — re-interpreting what they typed as markup
   // would be both wrong (they typed prose) and the one place a genuine
   // XSS sink could open up.
   if (role === 'agent') content.innerHTML = renderMarkdown(text);
   else content.textContent = text;
+  if (!hebrewDominant) wrapHebrewRuns(content);
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
