@@ -1,618 +1,484 @@
-"""Domain-model tests — the airport criteria, the unmet-demand model,
-and the runway geometry behind it. All of this lives in app/tools.py and
-app/runway_geometry.py, NOT in app/analytics.py or app/scoring.py.
+"""Domain tests for app/tools.py — the ranking KPIs (DEFAULT_CRITERIA),
+entity resolution as exposed through the tool surface, the full
+compare_items breakdown, and — the single most important thing this file
+pins — the eligibility gate holding across EVERY ranking tool, not just
+compare_items.
 
-The split matters: analytics.py holds the generic contract every modelled
-metric must satisfy (tested in test_analytics.py) and scoring.py the
-generic ranker (test_scoring.py). Both are domain-free and neither
-changes when the domain does. The formula, its constants, its causal
-reasoning, and the criteria themselves are this assignment's judgement —
-so they are tested here, separately, on purpose.
+Everything here runs against the REAL, committed dataset
+(data/processed_data/{localities,neighborhoods}.json), not a synthetic
+fixture. That is deliberate: app/tools.py's docstring and _gate_ids'
+docstring both describe a REAL prior-build bug (the gate lived only in
+compare_items; three sibling ranking tools reproduced the exact failure
+it existed to prevent), and a fixture-based test could not have caught
+that — it would have needed the fixture to also include a neighborhood
+id, which nobody writing a synthetic fixture is likely to think to add.
+Testing against the real 104-locality / 1,394-neighborhood dataset means
+the ids used below are real, resolvable things, and the numbers pinned
+below were produced by actually running the code on 2026-08-21 against
+the dataset committed at that date — see each test's own comment for how
+the expected value was obtained.
+
+Companion file: tests/test_tools_uncovered.py covers aggregate_records,
+estimate_derived_metric, find_items, rank_by_priorities,
+analyze_weight_sensitivity, weight_robustness_report, and
+get_current_mortgage_rates in more depth. This file's job is the
+criteria themselves, resolve_entity, compare_items' full breakdown, and
+the gate.
 """
 from __future__ import annotations
 
 import pytest
 
 from app import dataset
-from app.runway_geometry import (
-    DEPENDENT_APPROACH_MIN_SEPARATION_FT,
-    INDEPENDENT_APPROACH_MIN_SEPARATION_FT,
-    Runway,
-    arrival_capacity,
-    parallel_pairs,
-    perpendicular_separation_ft,
-)
 from app.tools import (
+    CRITERION_DESCRIPTIONS,
     DECISIVE_SCORE_GAP,
     DEFAULT_CRITERIA,
-    IMC_FRACTION,
-    PRACTICAL_CAPACITY_PER_ARRIVAL_STREAM,
+    UnknownItemError,
+    analyze_weight_sensitivity,
     compare_items,
-    estimate_unmet_demand,
-    find_items,
+    get_item_metrics,
     list_criteria,
+    rank_by_priorities,
+    resolve_entity,
+    weight_robustness_report,
 )
 
-# SFO's 28L/28R, from OurAirports' published runway-end coordinates. The
-# real separation is ~750 ft; this fixture is the actual data, so the
-# geometry test below is a check against reality, not against itself.
-SFO_10L = Runway("10L", 37.628742, -122.393410, 118.0, 11870.0)
-SFO_10R = Runway("10R", 37.626298, -122.393124, 118.0, 11381.0)
+# Real ids used throughout this file, named once so a reader doesn't have
+# to cross-reference CBS locality codes by hand:
+KEFAR_SAVA = "6900"
+RAANANA = "8700"
+BEER_SHEVA = "9000"
+TEL_AVIV = "5000"
+JERUSALEM = "3000"
+QIRYAT_MOTZKIN = "8200"
+JUDEIDE_MAKER = "1292"  # missing rental_yield — see the renormalization test below
+# A real neighborhood id (belongs to locality '28', Mazkeret Batya) — the
+# flagship case for _gate_ids: a real, resolvable id that is NOT a
+# rankable locality. Verified present in data/processed_data/neighborhoods.json.
+A_NEIGHBORHOOD_ID = "28:65211075"
+AN_UNKNOWN_ID = "not-a-real-id-999999"
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Runway geometry — the mechanism behind the "why"
+# DEFAULT_CRITERIA / CRITERION_DESCRIPTIONS — the KPIs themselves
 # ─────────────────────────────────────────────────────────────────────────
-def test_sfo_parallel_separation_matches_the_published_figure():
-    """The whole unmet-demand story rests on SFO's runways being ~750 ft
-    apart. If this computation drifts, the explanation becomes fiction —
-    so it is pinned against the real-world published number."""
-    assert perpendicular_separation_ft(SFO_10L, SFO_10R) == pytest.approx(750, abs=10)
-
-
-def test_separation_is_perpendicular_not_threshold_to_threshold():
-    """Staggered thresholds make the straight-line distance much larger
-    than the centerline separation. Using the wrong one moves SFO into
-    the wrong FAA band, which is why this is measured perpendicular."""
-    import math
-
-    ft_lon = 364_000.0 * math.cos(math.radians(SFO_10L.latitude_deg))
-    straight = math.hypot(
-        (SFO_10R.longitude_deg - SFO_10L.longitude_deg) * ft_lon,
-        (SFO_10R.latitude_deg - SFO_10L.latitude_deg) * 364_000.0,
-    )
-    assert straight > 850  # the naive number
-    assert perpendicular_separation_ft(SFO_10L, SFO_10R) < 800  # the correct one
-
-
-def test_perpendicular_separation_is_symmetric():
-    a = perpendicular_separation_ft(SFO_10L, SFO_10R)
-    b = perpendicular_separation_ft(SFO_10R, SFO_10L)
-    assert a == pytest.approx(b, abs=1.0)
-
-
-def test_close_parallels_collapse_to_one_arrival_stream_in_imc():
-    cap = arrival_capacity([SFO_10L, SFO_10R])
-    assert cap.vmc_streams == 2
-    assert cap.imc_streams == 1
-    assert cap.weather_degradation == pytest.approx(0.5)
-
-
-def test_widely_spaced_parallels_stay_independent_in_imc():
-    far = Runway("10R", 37.626298 + 0.02, -122.393124, 118.0, 11381.0)
-    cap = arrival_capacity([SFO_10L, far])
-    assert cap.parallel_pairs[0].separation_ft >= INDEPENDENT_APPROACH_MIN_SEPARATION_FT
-    assert cap.imc_streams == 2
-    assert cap.weather_degradation == 0.0
-
-
-def test_three_mutually_close_runways_collapse_to_one_not_two():
-    """Union-find, not pairwise counting: three runways each too close to
-    the next are ONE arrival stream. Counting pairs would say two."""
-    a = Runway("16L", 47.44, -122.31, 180.0, 11900.0)
-    b = Runway("16C", 47.44, -122.309, 180.0, 9426.0)
-    c = Runway("16R", 47.44, -122.308, 180.0, 8500.0)
-    cap = arrival_capacity([a, b, c])
-    assert cap.vmc_streams == 3
-    assert cap.imc_streams == 1
-
-
-def test_short_runways_do_not_count_as_arrival_capacity():
-    """SNA's short crosswind strip is general-aviation, not an air-carrier
-    arrival stream. Counting it would overstate capacity — the exact
-    overstatement ASSUMPTIONS.md flags for raw runway_count."""
-    short = Runway("06", 33.67, -117.86, 20.0, 2887.0)
-    long = Runway("20R", 33.67, -117.87, 200.0, 5701.0)
-    cap = arrival_capacity([short, long])
-    assert cap.vmc_streams == 1
-    assert cap.air_carrier_runways == 1
-
-
-def test_non_parallel_runways_are_not_paired():
-    a = Runway("09", 40.0, -74.0, 90.0, 10000.0)
-    b = Runway("18", 40.0, -74.0, 180.0, 10000.0)
-    assert parallel_pairs([a, b]) == ()
-
-
-def test_single_runway_airport_has_no_weather_degradation():
-    cap = arrival_capacity([SFO_10L])
-    assert cap.vmc_streams == 1
-    assert cap.imc_streams == 1
-    assert cap.weather_degradation == 0.0
-    assert cap.min_parallel_separation_ft is None
-
-
-def test_faa_separation_bands_are_ordered():
-    """Guards the constants themselves: independent must require MORE
-    separation than dependent, or the band logic silently inverts."""
-    assert INDEPENDENT_APPROACH_MIN_SEPARATION_FT > DEPENDENT_APPROACH_MIN_SEPARATION_FT
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# The unmet-demand model
-# ─────────────────────────────────────────────────────────────────────────
-def _sfo_like(**overrides):
-    kwargs = dict(
-        enplanements=26_251_850.0,
-        arrival_streams_vmc=4,
-        weather_capacity_degradation=0.5,
-        traffic_growth=0.0468,
-        regional_demand_growth=0.00513,
-    )
-    kwargs.update(overrides)
-    return estimate_unmet_demand(**kwargs)
-
-
-def test_unmet_demand_factor_magnitudes_sum_to_the_value():
-    """The 'why' must reconstruct the 'what' exactly — if factors don't
-    sum to the total, the explanation is decorative."""
-    result = _sfo_like()
-    assert sum(f.magnitude for f in result.factors) == pytest.approx(result.value)
-
-
-def test_unmet_demand_factor_shares_sum_to_one():
-    result = _sfo_like()
-    assert sum(f.share_of_total for f in result.factors) == pytest.approx(1.0)
-
-
-def test_weather_suppression_uses_the_degraded_capacity_and_imc_fraction():
-    """Pins the actual arithmetic, not just that a number came out."""
-    result = _sfo_like()
-    practical = 4 * PRACTICAL_CAPACITY_PER_ARRIVAL_STREAM
-    expected = max(0.0, 26_251_850.0 - practical * 0.5) * IMC_FRACTION
-    weather = next(f for f in result.factors if f.name == "weather_suppressed_throughput")
-    assert weather.magnitude == pytest.approx(expected)
-
-
-def test_quiet_airport_has_no_unmet_demand_even_when_weather_degraded():
-    """The self-gating property, and the reason this is a model rather
-    than arithmetic. Anchorage loses a third of its arrival capacity in
-    low visibility and still has zero unmet demand, because the remaining
-    capacity covers everything that wanted to fly."""
-    result = estimate_unmet_demand(
-        enplanements=2_729_285.0,
-        arrival_streams_vmc=3,
-        weather_capacity_degradation=0.33,
-        traffic_growth=-0.0139,
-        regional_demand_growth=0.00019,
-    )
-    assert result.value == 0.0
-    assert result.confidence == "low"
-
-
-def test_weather_degradation_increases_unmet_demand():
-    low = _sfo_like(weather_capacity_degradation=0.1)
-    high = _sfo_like(weather_capacity_degradation=0.6)
-    assert high.value > low.value
-
-
-def test_declining_growth_is_clamped_not_credited_as_headroom():
-    """A shrinking airport must never be handed negative unmet demand,
-    which would quietly read as spare capacity."""
-    shrinking = _sfo_like(traffic_growth=-0.5, regional_demand_growth=-0.5)
-    structural = next(
-        f for f in shrinking.factors if f.name == "structural_capacity_deficit"
-    )
-    assert structural.magnitude >= 0.0
-    assert shrinking.value >= 0.0
-
-
-def test_structural_deficit_appears_when_demand_exceeds_good_weather_capacity():
-    result = estimate_unmet_demand(
-        enplanements=40_000_000.0,
-        arrival_streams_vmc=2,
-        weather_capacity_degradation=0.0,
-        traffic_growth=0.05,
-        regional_demand_growth=0.01,
-    )
-    structural = next(f for f in result.factors if f.name == "structural_capacity_deficit")
-    assert structural.magnitude > 0
-    assert result.value > 0
-
-
-def test_low_utilization_drops_confidence_and_says_why():
-    result = estimate_unmet_demand(
-        enplanements=500_000.0,
-        arrival_streams_vmc=4,
-        weather_capacity_degradation=0.0,
-        traffic_growth=0.01,
-        regional_demand_growth=0.001,
-    )
-    assert result.confidence == "low"
-    assert "not this airport's constraint" in result.caveat
-
-
-def test_high_utilization_is_reported_as_a_lower_bound():
-    result = _sfo_like()
-    assert result.confidence == "medium"
-    assert "LOWER BOUND" in result.caveat
-
-
-def test_zero_capacity_does_not_crash():
-    """No arrival streams means an undefined utilization, which must not
-    read as 'constrained' via a NaN comparison."""
-    result = estimate_unmet_demand(
-        enplanements=1_000.0,
-        arrival_streams_vmc=0,
-        weather_capacity_degradation=0.0,
-        traffic_growth=0.0,
-        regional_demand_growth=0.0,
-    )
-    assert result.confidence == "low"
-
-
-def test_unmet_demand_always_carries_assumptions_and_a_caveat():
-    """The number never travels alone — that is the whole contract."""
-    for result in (_sfo_like(), _sfo_like(enplanements=1000.0)):
-        assert result.assumptions
-        assert result.caveat
-        assert result.confidence in {"low", "medium", "high"}
-
-
-def test_imc_fraction_is_flagged_as_the_weakest_assumption():
-    """It is a single national figure applied uniformly. If that stops
-    being stated, the model starts overclaiming."""
-    assert any("instrument conditions" in a.lower() for a in _sfo_like().assumptions)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# The criteria themselves
-# ─────────────────────────────────────────────────────────────────────────
-def test_criteria_weights_match_the_documented_split():
-    """25/25/20/15/15. If someone retunes these, DECISIONS.md and
-    DESIGN_DOC.md are now wrong and this test says so."""
+def test_default_criteria_has_the_five_documented_criteria_with_locked_weights():
+    """The weight table is a judgement call recorded at length in
+    app/tools.py's own header comment (measured correlations moved three
+    of the five weights off the original design sketch). Pinning the
+    final numbers here means a future edit to that judgement call has to
+    touch this test too, rather than silently drifting."""
     weights = {c.name: c.weight for c in DEFAULT_CRITERIA}
     assert weights == {
-        "traffic_growth": 25,
-        "regional_demand_growth": 25,
-        "catchment_monopoly": 20,
-        "capacity_pressure": 15,
-        "absolute_scale": 15,
+        "price_level": 30,
+        "accessibility": 20,
+        "price_momentum_vs_country": 20,
+        "socioeconomic_level": 15,
+        "rental_yield": 15,
+    }
+    assert sum(weights.values()) == 100
+
+
+def test_default_criteria_directions_match_the_documented_intent():
+    """price_level and accessibility are lower-is-better (cheaper /
+    closer wins); the other three are higher-is-better. Getting even one
+    of these backwards would silently invert half a criterion's meaning
+    while every other test that only checks ORDER (not direction) would
+    stay green."""
+    directions = {c.name: c.higher_is_better for c in DEFAULT_CRITERIA}
+    assert directions == {
+        "price_level": False,
+        "accessibility": False,
+        "price_momentum_vs_country": True,
+        "socioeconomic_level": True,
+        "rental_yield": True,
     }
 
 
-def test_size_flavoured_criteria_stay_a_minority_of_the_weight():
-    """The brief asks about INCREASED capacity, not current size. The
-    two size-correlated criteria must not dominate, or the ranking
-    silently answers the wrong question."""
-    weights = {c.name: c.weight for c in DEFAULT_CRITERIA}
-    size_like = weights["absolute_scale"] + weights["capacity_pressure"]
-    assert size_like < sum(weights.values()) / 2
-    assert weights["absolute_scale"] <= 0.25 * sum(weights.values())
+def test_every_criterion_has_a_plain_language_description():
+    """CRITERION_DESCRIPTIONS is what list_criteria and _focus_on_criterion
+    hand to the model — a criterion with no entry would render as an
+    empty string in a user-facing explanation, silently, with no test
+    catching a name added to DEFAULT_CRITERIA and forgotten here."""
+    for criterion in DEFAULT_CRITERIA:
+        assert criterion.name in CRITERION_DESCRIPTIONS
+        assert len(CRITERION_DESCRIPTIONS[criterion.name]) > 20
 
 
-def test_every_criterion_has_a_real_normalization_window():
-    for c in DEFAULT_CRITERIA:
-        assert c.lower_bound < c.upper_bound, c.name
+def test_criterion_bounds_are_not_degenerate():
+    """A lower_bound == upper_bound would make Criterion.normalize return
+    a constant 0.5 for every locality on that criterion (see
+    scoring.py's degenerate-bounds branch) — silently flattening it to
+    zero information. The frozen percentile bounds should never do this
+    for a real, continuously-valued field."""
+    for criterion in DEFAULT_CRITERIA:
+        assert criterion.lower_bound < criterion.upper_bound
 
 
-def test_criteria_names_match_the_dataset_fields():
-    """A criterion no airport supplies data for would silently vanish
-    into missing_criteria for every item and never be noticed."""
-    supplied = {k for m in dataset.METRICS.values() for k in m}
-    assert {c.name for c in DEFAULT_CRITERIA} <= supplied
-
-
-def test_list_criteria_exposes_every_default_weight_with_no_item_ids():
-    """The whole point of the tool: a meta-question about the methodology
-    must be answerable without any airport to compare. If this table ever
-    drifts from DEFAULT_CRITERIA, the 'proprietary weights' failure mode
-    is one incomplete tool result away from recurring."""
+def test_list_criteria_weight_percentages_sum_to_100():
     result = list_criteria()
-    returned = {c["name"]: c["weight"] for c in result["criteria"]}
-    assert returned == {c.name: c.weight for c in DEFAULT_CRITERIA}
+    total_pct = sum(c["weight_pct_of_total"] for c in result["criteria"])
+    assert total_pct == pytest.approx(100.0, abs=0.1)  # rounding to 1 dp each
 
 
-def test_list_criteria_percentages_sum_to_100():
+def test_list_criteria_states_the_score_is_not_investment_advice():
+    """list_criteria is the tool a meta-question about methodology routes
+    to (see its own docstring) — the 'value for money to live in, not an
+    investment score' framing is a load-bearing disclosure locked with
+    Roi (_working/PROGRESS.md decision 2), not decoration."""
     result = list_criteria()
-    assert sum(c["weight_pct_of_total"] for c in result["criteria"]) == pytest.approx(100.0)
+    assert "good value to live in" in result["score_meaning"].lower()
+    assert "not an investment-return score" in result["score_meaning"].lower()
 
 
-def test_list_criteria_every_entry_has_a_description():
-    result = list_criteria()
-    for c in result["criteria"]:
-        assert c["description"], c["name"]
+# ─────────────────────────────────────────────────────────────────────────
+# resolve_entity — against the REAL 104-locality catalog
+# ─────────────────────────────────────────────────────────────────────────
+def test_resolve_entity_modiin_is_genuinely_non_decisive():
+    """THE flagship non-decisive case (see _working/PROGRESS.md's own
+    'gotchas' section): 'Modiin' is close to BOTH Modi'in-Makkabbim-Re'ut
+    (1200) and Modi'in Illit (3797) — two real, different places, not a
+    typo of one 'true' answer. A resolver that silently picked the
+    higher-confidence candidate here would give a factually wrong answer
+    to a real, plausible user query with total confidence. Pinned to the
+    hand-verified values in PROGRESS.md so a resolver recalibration that
+    accidentally makes this decisive is caught immediately."""
+    result = resolve_entity("Modiin")
+    assert result["decisive"] is False
+    assert result["match_type"] == "locality"
+    ids = {c["item_id"] for c in result["candidates"]}
+    assert ids == {"1200", "3797"}
+
+    by_id = {c["item_id"]: c for c in result["candidates"]}
+    assert by_id["1200"]["confidence"] == pytest.approx(0.8581, abs=1e-4)
+    assert by_id["1200"]["name_en"] == "Modi'in-Makkabbim-Re'ut"
+    assert by_id["3797"]["confidence"] == pytest.approx(0.8227, abs=1e-4)
+    assert by_id["3797"]["name_en"] == "Modi'in Illit"
 
 
-def test_list_criteria_via_registry_takes_no_arguments():
-    from app.tools import TOOL_REGISTRY
-
-    result = TOOL_REGISTRY["list_criteria"]({})
-    assert {c["name"] for c in result["criteria"]} == {c.name for c in DEFAULT_CRITERIA}
-
-
-def test_lax_does_not_win_the_default_ranking():
-    """The single sharpest check that the criteria answer the brief's
-    question rather than 'which airport is biggest'."""
-    result = compare_items(list(dataset.ELIGIBLE_IDS))
-    top_ten = [r["item_id"] for r in result["ranking"][:10]]
-    assert "LAX" not in top_ten
+def test_resolve_entity_hebrew_exact_name_is_decisive():
+    """The contrasting case to Modiin: an exact Hebrew name with no real
+    competitor resolves cleanly, at full confidence, to Kefar Sava."""
+    result = resolve_entity("כפר סבא")
+    assert result["decisive"] is True
+    assert result["match_type"] == "locality"
+    assert result["candidates"][0]["item_id"] == KEFAR_SAVA
+    assert result["candidates"][0]["confidence"] == pytest.approx(1.0)
+    assert result["candidates"][0]["name_en"] == "Kefar Sava"
 
 
-def test_ranking_reports_a_statistical_tie_rather_than_a_false_winner():
-    """The top two airports are ~0.4% apart. Presenting that as a clear
-    winner claims precision the weighting judgement does not have."""
-    result = compare_items(list(dataset.ELIGIBLE_IDS))
-    ranked = result["ranking"]
-    gap = ranked[0]["total_score"] - ranked[1]["total_score"]
-    if gap <= DECISIVE_SCORE_GAP:
-        assert result["decisive"] is False
-        assert len(result["tied_at_top"]) >= 2
-    else:
-        assert result["decisive"] is True
-        assert result["tied_at_top"] == []
+def test_resolve_entity_region_query_returns_every_member_not_one_place():
+    """'the Krayot' names FOUR real localities, not the best-matching one
+    — collapsing a region query to a single locality would silently
+    decide something the user never asked. match_type must read
+    'region', distinct from an ordinary ambiguous locality match, so the
+    model routes to a different explanation ('this names an AREA')
+    rather than 'this name is ambiguous between places'."""
+    result = resolve_entity("Krayot")
+    assert result["match_type"] == "region"
+    assert result["decisive"] is False
+    ids = {c["item_id"] for c in result["candidates"]}
+    # The four real Krayot towns in the eligible set.
+    assert ids == {"6800", "9500", "9600", "8200"}
+    assert result["clarification_required"]
 
 
-def test_airports_missing_a_criterion_still_rank():
-    """14 airports have no Census population. They must rank on their
-    remaining criteria, not be dropped or scored a spurious zero — the
-    missing-data renormalization earning its keep on real ragged data."""
-    no_pop = [
-        k for k, m in dataset.METRICS.items()
-        if "regional_demand_growth" not in m and k in dataset.ELIGIBLE_IDS
-    ]
-    if not no_pop:
-        pytest.skip("no eligible airport is missing population data")
-    result = compare_items(no_pop[:3] + ["BOS"])
-    ranked_ids = {r["item_id"] for r in result["ranking"]}
-    assert no_pop[0] in ranked_ids
-    row = next(r for r in result["ranking"] if r["item_id"] == no_pop[0])
-    assert row["covered_weight"] < 1.0
-    assert "regional_demand_growth" in row["missing_criteria"]
+def test_resolve_entity_no_match_returns_empty_not_a_guess():
+    """A nonsense query is a normal fuzzy-search outcome (see
+    resolve_entity's own docstring), not an exception and not a
+    best-effort substitution of something similar-sounding."""
+    result = resolve_entity("zzzznotarealplaceinisrael9999")
+    assert result["candidates"] == []
+    assert result["decisive"] is False
 
 
-def test_ineligible_airports_cannot_enter_a_ranking_by_the_back_door():
-    """The eligibility gate must hold even when the caller passes tiny
-    airports directly. Found live: the model called find_items without
-    the eligibility filter and New Bedford Regional (3,145 passengers,
-    +53% 'growth') came back ranked 4th in New England — the exact
-    failure the gate exists to prevent. A filter the caller has to
-    remember is a filter that gets forgotten, so it is enforced here."""
-    result = compare_items(["BOS", "EWB", "BGR", "PVD"])
-    ranked_ids = [r["item_id"] for r in result["ranking"]]
-    assert "EWB" not in ranked_ids
-    assert "BGR" not in ranked_ids
+# ─────────────────────────────────────────────────────────────────────────
+# compare_items — full breakdown, pinned against a real pair
+# ─────────────────────────────────────────────────────────────────────────
+def test_compare_kefar_sava_vs_raanana_full_breakdown():
+    """Pinned end-to-end against real nadlan.gov.il/CBS figures, hand
+    verified (see _working/agent-logs/tool-tests.md). Kefar Sava wins
+    despite Ra'annana being closer to Tel Aviv and having stronger price
+    momentum, because Ra'annana is meaningfully MORE expensive
+    (3,381,700 vs 2,753,850 ₪) and price_level carries the largest single
+    weight (30) — a real, checkable instance of the ranking doing what
+    DEFAULT_CRITERIA's own header comment says it should."""
+    result = compare_items([KEFAR_SAVA, RAANANA])
 
-    # Set aside, never silently dropped — the user asked about them.
-    set_aside = {i["item_id"] for i in result["ineligible"]}
-    assert set_aside == {"EWB", "BGR"}
-    assert all(i["reason"] for i in result["ineligible"])
-
-
-def test_ineligible_airports_can_be_included_deliberately():
-    result = compare_items(["BOS", "EWB"], include_ineligible=True)
-    assert {r["item_id"] for r in result["ranking"]} == {"BOS", "EWB"}
+    assert result["decisive"] is True
+    assert result["tied_at_top"] == []
     assert result["ineligible"] == []
+    assert result["excluded"] == []
+    assert result["no_items_ranked"] is False
 
+    assert [r["item_id"] for r in result["ranking"]] == [KEFAR_SAVA, RAANANA]
+    winner, runner_up = result["ranking"]
 
-def test_unknown_category_is_not_reported_as_zero():
-    """A category that does not exist and a category with zero rows are
-    different answers. Found live: the model asked for 'long haul',
-    matched nothing, and said '0% of flights out of Anchorage are long
-    haul' — every number correct, the sentence false."""
-    from app.tools import aggregate_records
+    assert winner["name_en"] == "Kefar Sava"
+    assert winner["total_score"] == pytest.approx(0.5797, abs=1e-4)
+    assert winner["covered_weight"] == pytest.approx(1.0)
+    assert winner["missing_criteria"] == []
+    assert len(winner["components"]) == 5
 
-    result = aggregate_records("ANC", "share", "long haul")
-    assert result["unknown_category"] is True
-    assert result["value"] is None
-    assert result["defined"] is False
-    assert "domestic" in result["known_categories"]
-    assert result["category_semantics"]
-
-
-def test_known_category_still_aggregates_normally():
-    from app.tools import aggregate_records
-
-    result = aggregate_records("ANC", "share", "international")
-    assert result["unknown_category"] is False
-    assert 0.0 < result["value"] < 1.0
-
-
-def test_find_items_via_registry_with_no_arguments_does_not_crash():
-    """filters={} is a meaningful call ('match everything', per
-    find_items' own docstring), not malformed input. Found live in P4
-    evals: gpt-4o-mini called find_items with no arguments at all and got
-    a raw KeyError('filters') logged as a tool error, wasting a turn on a
-    request that was clearly asking for the whole dataset."""
-    from app.tools import TOOL_REGISTRY
-
-    result = TOOL_REGISTRY["find_items"]({})
-    assert result["match_count"] == len(dataset.AIRPORTS)
-
-
-def test_find_items_reports_the_real_values_when_a_known_key_matches_nothing():
-    """The brief's OWN first question, failing live against gpt-4o-mini:
-    "Which airports in New England are strong candidates for terminal
-    expansion?" -> find_items({'region': 'New England'}) -> 0 rows ->
-    "there are no airports in New England that match."
-
-    `region` is a real key, so unknown_filter_keys was empty and the model
-    had no way to tell "you invented a value" from "none exist". It holds
-    Census REGIONS; New England is a Census DIVISION. There are 23 such
-    airports under {'new_england': 'yes'}.
-
-    Pins that the empty result now carries the real value space, so the
-    model can correct itself rather than assert a false absence."""
-    result = find_items({"region": "New England"})
-
-    assert result["match_count"] == 0
-    # The key IS known — which is precisely why the old signal was silent.
-    assert result["unknown_filter_keys"] == []
-    assert result["known_values_for_filtered_keys"]["region"]["values"] == [
-        "Midwest",
-        "Northeast",
-        "Other",
-        "South",
-        "West",
-    ]
-    assert "New England" in result["guidance"]
-    # The route to the right answer must be discoverable from the result.
-    assert "new_england" in result["known_attribute_keys"]
-
-
-def test_find_items_new_england_key_returns_the_airports_that_do_exist():
-    """The other half: the correct call must actually work, or the
-    guidance above sends the model somewhere equally empty."""
-    result = find_items({"new_england": "yes"})
-    assert result["match_count"] == 23
-    assert "guidance" not in result
-
-
-def test_find_items_accepts_a_flattened_call_instead_of_matching_everything():
-    """Found live on the brief's first question. The model called
-    find_items({'new_england': 'yes'}) — filter keys at the top level,
-    no 'filters' wrapper. args.get('filters') was None, "no filters"
-    means "match everything", so a request for a 23-row SUBSET returned
-    all 515 rows and reported success. The model then named New England
-    airports from memory, which is the hallucination this tool exists to
-    prevent.
-
-    Both shapes must mean the same thing."""
-    from app.tools import TOOL_REGISTRY
-
-    flattened = TOOL_REGISTRY["find_items"]({"new_england": "yes"})
-    nested = TOOL_REGISTRY["find_items"]({"filters": {"new_england": "yes"}})
-
-    assert flattened["match_count"] == 23
-    assert flattened["item_ids"] == nested["item_ids"]
-    # The echoed filters are the audit trail: the log shows what was applied.
-    assert flattened["filters"] == {"new_england": "yes"}
-
-
-def test_find_items_no_arguments_still_means_match_everything():
-    """The flattening fix must not break the legitimate empty call — that
-    behaviour was itself a P4 eval finding and is documented in the
-    tool's own docstring."""
-    from app.tools import TOOL_REGISTRY
-
-    assert TOOL_REGISTRY["find_items"]({})["match_count"] == len(dataset.AIRPORTS)
-    assert TOOL_REGISTRY["find_items"]({"filters": None})["match_count"] == len(
-        dataset.AIRPORTS
+    by_criterion = {c["criterion"]: c for c in winner["components"]}
+    assert by_criterion["price_level"]["raw_value"] == pytest.approx(2753850.0)
+    assert by_criterion["price_level"]["weight"] == pytest.approx(0.30)
+    assert by_criterion["accessibility"]["raw_value"] == pytest.approx(16.28)
+    assert by_criterion["socioeconomic_level"]["raw_value"] == pytest.approx(8.0)
+    assert by_criterion["rental_yield"]["raw_value"] == pytest.approx(3.27)
+    # The breakdown must reconstruct the total — the same invariant
+    # test_scoring.py's arithmetic tests pin for the generic ranker,
+    # checked here again end-to-end through the tool layer's own
+    # rounding (compare_items rounds every field independently before
+    # returning it, so this is a real check that rounding didn't quietly
+    # break the reconstruction property, not a restatement of the
+    # scoring.py test).
+    assert sum(c["contribution"] for c in winner["components"]) == pytest.approx(
+        winner["total_score"], abs=1e-3
     )
 
-
-def test_find_items_success_path_carries_no_diagnostics():
-    """The diagnostic fires only when it's needed. A successful filter
-    must not pay for it — every extra key here is context the model reads
-    on every single call."""
-    result = find_items({"hub_class": "L"})
-    assert result["match_count"] > 0
-    assert "guidance" not in result
-    assert "known_values_for_filtered_keys" not in result
+    assert runner_up["name_en"] == "Ra'annana"
+    assert runner_up["total_score"] == pytest.approx(0.4701, abs=1e-4)
+    assert runner_up["total_score"] < winner["total_score"]
 
 
-# ── focus_criterion: answering a single-dimension question ─────────────
-# Origin, from running the brief's own example question against the real
-# model: asked to "compare LA and Santa Ana congestion levels" the agent
-# read the composite total_score and concluded "LAX has the higher total
-# score, therefore LAX is more congested." Both halves true, conclusion
-# false — total_score blends five criteria and only one of them is the
-# congestion proxy. Two rounds of system-prompt instruction did not stop
-# it, so the answer moved into the tool, where the rest of this file's
-# numbers already live.
+def test_compare_items_tie_and_missing_field_renormalization_on_the_real_leaderboard():
+    """Two real findings from ranking the FULL eligible set, both pinned
+    together because they occur in the SAME real pair and this is the
+    exact scenario app/tools.py's own header comment for
+    DECISIVE_SCORE_GAP describes hand-checking:
+
+    1. TIE: at the final weights, Qiryat Motzkin (0.7257) and
+       Judeide-Maker (0.7245) are the real #1/#2 of the whole eligible
+       set and differ by only 0.0012 — inside DECISIVE_SCORE_GAP
+       (0.005). This must come back non-decisive with both ids in
+       tied_at_top; presenting Qiryat Motzkin as an unqualified winner
+       would claim a precision the data does not support.
+
+    2. MISSING-FIELD RENORMALIZATION: Judeide-Maker is one of the real
+       6/104 localities missing rental_yield (see dataset.py's
+       docstring on join coverage). Its covered_weight is therefore
+       0.85 (85/100 = the weight of the other four criteria), and its
+       remaining four component weights are renormalized over that 85,
+       not the original 100 — e.g. price_level's component weight
+       becomes 0.30/0.85 = 0.3529, not 0.30. This is real data
+       demonstrating rank_items' renormalization behavior (already unit
+       tested in isolation in test_scoring.py) actually firing on the
+       committed dataset.
+    """
+    result = compare_items([QIRYAT_MOTZKIN, JUDEIDE_MAKER])
+
+    assert result["decisive"] is False
+    assert set(result["tied_at_top"]) == {QIRYAT_MOTZKIN, JUDEIDE_MAKER}
+    assert result["ranking"][0]["item_id"] == QIRYAT_MOTZKIN
+    assert result["ranking"][0]["total_score"] == pytest.approx(0.7257, abs=1e-4)
+
+    judeide = next(r for r in result["ranking"] if r["item_id"] == JUDEIDE_MAKER)
+    assert judeide["total_score"] == pytest.approx(0.7245, abs=1e-4)
+    assert judeide["covered_weight"] == pytest.approx(0.85)
+    assert judeide["missing_criteria"] == ["rental_yield"]
+    assert len(judeide["components"]) == 4  # rental_yield dropped, not scored as 0
+
+    by_criterion = {c["criterion"]: c for c in judeide["components"]}
+    assert "rental_yield" not in by_criterion
+    # Renormalized weight = original_weight / covered_weight, e.g.
+    # 0.30 / 0.85 — the exact renormalization scoring.py's own tests
+    # pin in the abstract, confirmed firing here on a real gap.
+    assert by_criterion["price_level"]["weight"] == pytest.approx(0.30 / 0.85, abs=1e-3)
+    assert by_criterion["socioeconomic_level"]["weight"] == pytest.approx(0.15 / 0.85, abs=1e-3)
+    # Component weights still sum to 1.0 even after renormalization.
+    assert sum(c["weight"] for c in judeide["components"]) == pytest.approx(1.0, abs=1e-3)
 
 
-def test_focus_is_absent_unless_asked_for():
-    """The default must stay the full weighted ranking. This is the
-    regression test for the first attempt at the fix, which made the
-    model apply a single-criterion view to 'which airports are strong
-    candidates for terminal expansion' and rank New England by traffic
-    growth alone — a worse answer than the one being fixed."""
-    from app.tools import compare_items
-
-    assert compare_items(["LAX", "SNA"])["focus"] is None
-
-
-def test_focus_ranks_on_that_criterion_alone_not_on_the_total():
-    from app.tools import compare_items
-
-    result = compare_items(["LAX", "SNA"], focus_criterion="traffic_growth")
+def test_compare_items_focus_criterion_answers_the_named_dimension_not_total_score():
+    """Asked 'which has the better rental yield', a model reading only
+    total_score would answer with the wrong place — total_score blends
+    all five criteria, and Kefar Sava's total_score win is NOT the same
+    fact as Kefar Sava having the higher rental_yield (it does, but for
+    a question this specific the tool must say so explicitly rather than
+    have the model infer it from a number that doesn't mean that)."""
+    result = compare_items([KEFAR_SAVA, RAANANA], focus_criterion="rental_yield")
     focus = result["focus"]
-    rows = focus["ranked_by_this_criterion_alone"]
-    # SNA has positive traffic growth and LAX negative, while LAX wins the
-    # composite. If these two orderings ever agree, this test is no longer
-    # checking anything — which is exactly why this pair was chosen.
-    assert [r["item_id"] for r in rows] == ["SNA", "LAX"]
-    assert result["ranking"][0]["item_id"] == "LAX"
-    assert focus["highest"] == "SNA"
-    assert focus["lowest"] == "LAX"
+    assert focus is not None
+    assert focus["criterion"] == "rental_yield"
+    assert focus["best"] == KEFAR_SAVA  # 3.27 vs 2.51 — Kefar Sava has the higher yield
+    assert focus["worst"] == RAANANA
+    assert focus["higher_is_better"] is True
+    ordered_ids = [row["item_id"] for row in focus["ranked_by_this_criterion_alone"]]
+    assert ordered_ids == [KEFAR_SAVA, RAANANA]
+    # The tool must say plainly this is not the composite score, so a
+    # model relaying it can't accidentally conflate the two.
+    assert "not" in focus["note"].lower()
+    assert "total_score" not in focus["criterion"]
 
 
-def test_focus_numbers_are_the_same_numbers_as_the_main_ranking():
-    """Nothing is recomputed — the focus block re-reads components the
-    scoring pass already produced. If it ever disagreed with the ranking
-    it sits next to, the agent would have two different answers for the
-    same question."""
-    from app.tools import compare_items
-
-    result = compare_items(["LAX", "SNA", "BOS"], focus_criterion="capacity_pressure")
-    from_ranking = {
-        entry["item_id"]: next(
-            c["raw_value"] for c in entry["components"] if c["criterion"] == "capacity_pressure"
-        )
-        for entry in result["ranking"]
-    }
-    from_focus = {r["item_id"]: r["raw_value"] for r in result["focus"]["ranked_by_this_criterion_alone"]}
-    assert from_focus == from_ranking
+def test_compare_items_focus_criterion_unknown_name_reports_an_error_not_silence():
+    """A bad criterion name (a typo the model made up) must fail loudly
+    in the response — falling back to describing the composite score
+    would be exactly the failure focus_criterion exists to prevent."""
+    result = compare_items([KEFAR_SAVA, RAANANA], focus_criterion="walkability")
+    assert result["focus"]["error"] is not None
+    assert "walkability" in result["focus"]["error"]
 
 
-def test_focus_carries_the_warning_not_to_read_it_as_the_total_score():
-    from app.tools import compare_items
-
-    note = compare_items(["LAX", "SNA"], focus_criterion="capacity_pressure")["focus"]["note"]
-    assert "total_score" in note
-    assert "capacity_pressure" in note
-
-
-def test_focus_reports_an_unknown_criterion_instead_of_ignoring_it():
-    """A typo must not degrade quietly into 'no focus block', because the
-    model would then answer from the composite — the exact failure this
-    parameter exists to prevent."""
-    from app.tools import compare_items
-
-    focus = compare_items(["LAX", "SNA"], focus_criterion="congestion")["focus"]
-    assert "error" in focus
-    assert "capacity_pressure" in focus["error"]  # names the valid options
-    assert "ranked_by_this_criterion_alone" not in focus
+def test_compare_items_no_items_ranked_flag_is_true_when_the_list_is_empty():
+    """An empty ranking is a real, reachable outcome (every id gated out)
+    and must be an AFFIRMATIVE signal, not a payload indistinguishable
+    from 'nothing was ranked because the caller passed no ids and this
+    silently means agreement'. See compare_items' own comment on this
+    field."""
+    result = compare_items([A_NEIGHBORHOOD_ID])  # the only id gated out entirely
+    assert result["ranking"] == []
+    assert result["no_items_ranked"] is True
+    assert result["decisive"] is False  # no winner exists when nothing is ranked
 
 
-def test_focus_separates_no_data_from_a_low_value():
-    """'No data' and 'the smallest number' are different answers to
-    'which is more congested', and collapsing them would invent a fact."""
-    ranking = [
-        {
-            "item_id": "AAA",
-            "components": [{"criterion": "capacity_pressure", "raw_value": 100.0, "normalized_score": 0.5}],
-        },
-        {"item_id": "BBB", "components": [{"criterion": "capacity_pressure", "raw_value": None, "normalized_score": None}]},
-    ]
-    from app.tools import DEFAULT_CRITERIA, _focus_on_criterion
-
-    focus = _focus_on_criterion("capacity_pressure", ranking, DEFAULT_CRITERIA)
-    assert focus["no_data_for"] == ["BBB"]
-    assert [r["item_id"] for r in focus["ranked_by_this_criterion_alone"]] == ["AAA"]
-    assert focus["lowest"] == "AAA"  # not BBB — BBB has no value at all
+# ─────────────────────────────────────────────────────────────────────────
+# Errors — unknown ids and neighborhood-not-rankable
+# ─────────────────────────────────────────────────────────────────────────
+def test_unknown_locality_id_raises_and_points_at_resolve_entity():
+    """An id that is neither a known locality nor a known neighborhood is
+    a real error (system_prompt.py's NEVER_INVENT_IDS_RULE) — the message
+    must name resolve_entity as the correct next step, not just say
+    'not found', so a model reading the error has an actionable next
+    tool call rather than a dead end."""
+    with pytest.raises(UnknownItemError) as excinfo:
+        get_item_metrics(AN_UNKNOWN_ID)
+    assert "resolve_entity" in str(excinfo.value)
+    assert AN_UNKNOWN_ID in str(excinfo.value)
 
 
-def test_focus_is_reachable_through_the_registry():
-    """The schema exposes focus_criterion, so the registry dispatch has to
-    forward it — a parameter the model can request and the dispatcher
-    drops is worse than one that does not exist."""
-    from app.tools import TOOL_REGISTRY
+def test_neighborhood_id_passed_to_get_item_metrics_names_it_as_a_neighborhood():
+    """get_item_metrics (single-item, non-ranking) hits the SAME
+    fetch_item_metrics as every ranking tool, so a neighborhood id here
+    must raise the specific 'this is a neighborhood, not a locality'
+    error, distinct from an ordinary unknown-id error — the two are
+    different facts (a real, un-rankable thing vs. nothing at all) and
+    conflating them would misdirect the model's next move."""
+    with pytest.raises(UnknownItemError) as excinfo:
+        get_item_metrics(A_NEIGHBORHOOD_ID)
+    message = str(excinfo.value)
+    assert "NEIGHBORHOOD" in message
+    assert "28" in message  # names the real parent locality id
+    assert "aggregate_records" in message  # points at the tool that DOES answer this
 
-    result = TOOL_REGISTRY["compare_items"](
-        {"item_ids": ["LAX", "SNA"], "focus_criterion": "capacity_pressure"}
-    )
-    assert result["focus"]["criterion"] == "capacity_pressure"
-    assert TOOL_REGISTRY["compare_items"]({"item_ids": ["LAX", "SNA"]})["focus"] is None
+
+# ─────────────────────────────────────────────────────────────────────────
+# THE ELIGIBILITY GATE — parametrized across ALL FOUR ranking tools
+# ─────────────────────────────────────────────────────────────────────────
+# This is the single most important test in this file. In the prior
+# (airport) build, the eligibility gate lived only inside compare_items,
+# on the reasoning that "a filter the caller has to remember is a filter
+# that gets forgotten" — and then three sibling ranking tools
+# (rank_by_priorities, analyze_weight_sensitivity, weight_robustness_report)
+# were added that did NOT call it, each one reproducing the exact bug the
+# gate was written to prevent: a neighborhood id, which has no
+# socioeconomic/accessibility/income data of its own, silently scored on
+# a sliver of the criteria and presented as a fairly-ranked peer of a
+# real city.
+#
+# app/tools.py's _gate_ids docstring says this was fixed by calling
+# _gate_ids from all four ranking tools, and says so is pinned by "this"
+# test. This IS that test — written as a single parametrized case over
+# all four callables, specifically so that a FIFTH ranking tool added
+# later without wiring in the gate fails this test immediately, rather
+# than needing someone to remember to add a new bespoke test for it.
+#
+# Each wrapper below normalizes the four tools' different signatures
+# (they take different required arguments beyond item_ids) down to a
+# single (item_ids) -> {"ineligible": [...], <ranked-ids>: [...]} shape,
+# so the parametrize body can assert the same two things about all four
+# without caring about each tool's own argument list.
+def _compare_wrapper(item_ids: list[str]) -> tuple[list[dict], list[str]]:
+    result = compare_items(item_ids)
+    return result["ineligible"], [r["item_id"] for r in result["ranking"]]
 
 
-def test_focus_criterion_enum_matches_the_real_criteria():
-    """The schema lists the valid criterion names inline for the model.
-    If a criterion is renamed and the enum is not, the model requests a
-    name the tool rejects."""
-    from app.tools import DEFAULT_CRITERIA, TOOL_SCHEMAS
+def _rank_by_priorities_wrapper(item_ids: list[str]) -> tuple[list[dict], list[str]]:
+    result = rank_by_priorities(item_ids)
+    return result["ineligible"], [r["item_id"] for r in result["default_ranking"]]
 
-    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "compare_items")
-    enum = schema["function"]["parameters"]["properties"]["focus_criterion"]["enum"]
-    assert sorted(enum) == sorted(c.name for c in DEFAULT_CRITERIA)
+
+def _sensitivity_wrapper(item_ids: list[str]) -> tuple[list[dict], list[str]]:
+    result = analyze_weight_sensitivity(item_ids, criterion="price_level", factor=1.5)
+    return result["ineligible"], [c["item_id"] for c in result["changes"]]
+
+
+def _robustness_wrapper(item_ids: list[str]) -> tuple[list[dict], list[str]]:
+    result = weight_robustness_report(item_ids)
+    return result["ineligible"], [r["item_id"] for r in result["baseline_ranking"]]
+
+
+_RANKING_TOOL_WRAPPERS = [
+    pytest.param(_compare_wrapper, id="compare_items"),
+    pytest.param(_rank_by_priorities_wrapper, id="rank_by_priorities"),
+    pytest.param(_sensitivity_wrapper, id="analyze_weight_sensitivity"),
+    pytest.param(_robustness_wrapper, id="weight_robustness_report"),
+]
+
+
+@pytest.mark.parametrize("wrapper", _RANKING_TOOL_WRAPPERS)
+def test_gate_enforced_in_all_four_ranking_tools(wrapper):
+    """A NEIGHBORHOOD id, mixed in with one real locality, must be set
+    aside with a reason in EVERY one of these four tools, and must NOT
+    appear in that tool's own ranked-ids output. If a fifth ranking tool
+    is ever added to app/tools.py and wired into this parametrize list
+    without also calling _gate_ids, this test fails loudly for it,
+    rather than silently passing because nobody remembered to write a
+    bespoke gate test for the new tool."""
+    ineligible, ranked_ids = wrapper([A_NEIGHBORHOOD_ID, KEFAR_SAVA])
+
+    assert len(ineligible) == 1
+    assert ineligible[0]["item_id"] == A_NEIGHBORHOOD_ID
+    assert "NEIGHBORHOOD" in ineligible[0]["reason"]
+    assert ineligible[0]["parent_locality_id"] == "28"
+
+    assert A_NEIGHBORHOOD_ID not in ranked_ids
+    assert KEFAR_SAVA in ranked_ids
+
+
+@pytest.mark.parametrize("wrapper", _RANKING_TOOL_WRAPPERS)
+def test_gate_with_only_a_neighborhood_id_ranks_nothing_but_still_explains_why(wrapper):
+    """The degenerate case of the same gate: EVERY requested id is a
+    neighborhood, so nothing is rankable at all. This must not raise or
+    silently return an empty result with no explanation — 'ineligible'
+    must still carry the reason, for all four tools."""
+    ineligible, ranked_ids = wrapper([A_NEIGHBORHOOD_ID])
+    assert ranked_ids == []
+    assert len(ineligible) == 1
+    assert ineligible[0]["item_id"] == A_NEIGHBORHOOD_ID
+
+
+def test_gate_an_unknown_id_mixed_with_a_neighborhood_id_is_not_silently_absorbed():
+    """_gate_ids' own docstring distinguishes 'a real thing that isn't
+    rankable' (a neighborhood — comes back in `ineligible`) from 'not in
+    the dataset at all' (an unknown id — must raise, via
+    fetch_item_metrics, once the gate passes it through unchanged).
+    Checked once against compare_items; the other three tools share the
+    exact same _gate_ids + fetch_item_metrics call sequence, so this is
+    not repeated per-tool the way the gate-itself test above is."""
+    with pytest.raises(UnknownItemError):
+        compare_items([A_NEIGHBORHOOD_ID, AN_UNKNOWN_ID])
+
+
+def test_gate_does_not_touch_a_request_containing_only_real_localities():
+    """The gate must be a no-op when nothing needs gating — every id
+    passed through untouched, ineligible empty. Guards against an
+    over-eager implementation that filters or reorders ids it had no
+    reason to touch."""
+    result = compare_items([KEFAR_SAVA, RAANANA, BEER_SHEVA])
+    assert result["ineligible"] == []
+    assert {r["item_id"] for r in result["ranking"]} == {KEFAR_SAVA, RAANANA, BEER_SHEVA}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Every locality in the eligible set has a real, resolvable name — a
+# cheap but real sanity check that dataset.py and tools.py agree on the
+# item universe (see dataset.py's own module docstring on the
+# LOCALITIES/NEIGHBORHOODS split).
+# ─────────────────────────────────────────────────────────────────────────
+def test_eligible_ids_are_all_real_localities_not_neighborhoods():
+    for item_id in dataset.ELIGIBLE_IDS:
+        assert item_id in dataset.LOCALITIES
+        assert item_id not in dataset.NEIGHBORHOODS

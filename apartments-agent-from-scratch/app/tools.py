@@ -38,7 +38,6 @@ from app.affordability import (
     years_of_income_to_buy,
 )
 from app.analytics import (
-    SUPPORTED_OPERATIONS,
     DerivedMetricResult,
     FactorInput,
     aggregate,
@@ -291,6 +290,29 @@ def _neighborhood_not_rankable(item_id: str) -> UnknownItemError:
 #    app/providers/llm/anthropic_llm.py) ────────────────────────────────────
 _CRITERION_NAMES: list[str] = [c.name for c in DEFAULT_CRITERIA]
 
+# app/analytics.py's aggregate() supports share/mean/count/sum, because it is a
+# general-purpose module and those are the four aggregates any record set might
+# want. This tool deliberately offers only TWO of them.
+#
+# The reason is the shape of THIS domain's records: one record is one
+# neighborhood, carrying a constant units=1.0 (see app/dataset.py) so that
+# "share" comes out as a share BY COUNT of neighborhoods -- which is what "what
+# share of Tel Aviv's neighborhoods are above the city median" actually asks.
+# That constant makes the other two degenerate: `mean` can only ever return
+# 1.0, and `sum` is always exactly `count`.
+#
+# Both would still "work" -- nothing crashes, nothing lies. But a tool schema is
+# a promise to the model about what it can usefully ask for, and advertising an
+# operation whose answer is always 1.0 invites the model to call it and then
+# explain a meaningless number to a user. Narrowing the enum is cheaper and
+# more honest than documenting a trap.
+#
+# Summing or averaging area medians would be the wrong statistic anyway even if
+# units carried price: the mean of 41 neighborhood medians is not the median of
+# the city, and their sum means nothing at all.
+AGGREGATE_OPERATIONS_OFFERED: tuple[str, ...] = ("share", "count")
+
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -483,7 +505,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "item_id": {"type": "string"},
-                    "operation": {"type": "string", "enum": list(SUPPORTED_OPERATIONS)},
+                    "operation": {"type": "string", "enum": list(AGGREGATE_OPERATIONS_OFFERED)},
                     "category": {
                         "type": "string",
                         "description": (
@@ -1112,6 +1134,24 @@ def aggregate_records(item_id: str, operation: str, category: str | None = None)
         if item_id in dataset.NEIGHBORHOODS:
             raise _neighborhood_not_rankable(item_id)
         raise _unknown_item(item_id)
+
+    # Belt-and-braces behind the schema enum. The enum already narrows the
+    # model's choices to AGGREGATE_OPERATIONS_OFFERED, but a schema is a
+    # request, not a guarantee: providers do hallucinate enum values, and
+    # analytics.aggregate() would happily accept "mean" or "sum" and return
+    # a technically-correct, semantically-empty number (see the comment on
+    # AGGREGATE_OPERATIONS_OFFERED). Failing loudly with the reason is far
+    # better than handing the model 1.0 and letting it narrate that to a
+    # user as if it meant something.
+    if operation not in AGGREGATE_OPERATIONS_OFFERED:
+        raise ValueError(
+            f"operation={operation!r} is not available for neighborhood records. "
+            f"Supported here: {list(AGGREGATE_OPERATIONS_OFFERED)}. "
+            "'mean' and 'sum' are deliberately not offered: each record is one "
+            "neighborhood carrying a constant unit, so their mean is always 1.0 "
+            "and their sum is always the count. To compare neighborhood price "
+            "levels, use 'share' against a category instead."
+        )
 
     records = dataset.RECORDS[item_id]
     counts = dataset.NEIGHBORHOOD_COUNTS[item_id]

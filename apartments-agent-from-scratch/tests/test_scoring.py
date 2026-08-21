@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import pytest
 
+from app import dataset
+from app.tools import DEFAULT_CRITERIA
 from app.scoring import (
     Criterion,
     InsufficientCoverageError,
@@ -610,11 +612,113 @@ def test_contribution_is_linear_in_the_normalized_score():
     )
 
 
-# TODO(pin): re-add test_real_dataset_scores_are_pinned_to_known_values
-# once the real Israeli locality dataset (app/dataset.py) and
-# DEFAULT_CRITERIA (app/tools.py) exist. It should score a couple of
-# known localities via rank_items(DEFAULT_CRITERIA) and pin their
-# total_score to values hand-checked against README/DESIGN.md, exactly
-# like the airport-era version of this test did against LAX/SNA — this
-# is the regression check that a change to the scoring core is caught
-# offline, without a paid eval run.
+# ─────────────────────────────────────────────────────────────────────────
+# Real-dataset pin — the regression check an offline test suite needs
+# ─────────────────────────────────────────────────────────────────────────
+# Everything above this line tests scoring.py against small, hand-built
+# fixtures chosen to isolate one property at a time. None of them would
+# notice if a NORMALIZATION BOUND drifted — e.g. price_level's upper_bound
+# silently changing from 3,467,262.5 to some other number after a data
+# refresh — because a hand-built fixture's bounds are redefined alongside
+# it in the same test. The only thing that catches a bound moving under
+# real data is scoring the REAL data and pinning the result.
+#
+# This is not a hypothetical risk: the airport-era version of this exact
+# test (against LAX/SNA) caught a silent drift in a normalization floor
+# that had moved a real ranking, with nobody having changed anything on
+# purpose. That is what this test is for, and why it must be a PIN —
+# literal expected numbers written into the test — rather than a
+# tautology like `assert score == rank_items(...)`, which would just
+# restate whatever the code currently does and catch nothing.
+#
+# Five localities, picked to span the actual ranking rather than
+# clustering near the top: Kefar Sava (the real #1 at these weights —
+# see app/tools.py's DECISIVE_SCORE_GAP comment), Tel Aviv-Yafo and
+# Ra'annana (expensive, high-socioeconomic, opposite ends of rental
+# yield), Be'er Sheva (cheap, peripheral), and Jerusalem (expensive AND
+# lower socioeconomic-cluster-for-its-price than Tel Aviv, so it lands
+# LAST among these five despite being a major city — a genuinely
+# discriminating result, not a foregone one). All five have full 5/5
+# criterion coverage (covered_weight == 1.0), so this test is purely
+# about the scoring arithmetic and the frozen bounds/weights, with no
+# renormalization-for-missing-data interaction to also account for.
+#
+# Values below were produced by running, on 2026-08-21, against the
+# dataset committed at that date:
+#
+#     items = {i: dataset.METRICS[i] for i in _PIN_IDS}
+#     rank_items(items, DEFAULT_CRITERIA)
+#
+# and reading off result.ranked[*].total_score to 16 significant digits.
+# They are NOT re-derived at test time from anything the test imports —
+# copying the runtime value into the assertion would make this a
+# tautology, exactly the failure mode this comment warns against two
+# paragraphs up.
+#
+# IF THIS TEST FAILS: it means either (a) data/refresh_data.py was rerun
+# and the underlying nadlan.gov.il/CBS figures for one of these five
+# localities changed (expected, requires no code change — re-pin after a
+# human confirms the new numbers look sane), or (b) DEFAULT_CRITERIA's
+# weights/bounds in app/tools.py moved, or scoring.py's arithmetic
+# changed (NOT expected from a routine data refresh — this is the
+# scenario the airport-era version of this test actually caught, and it
+# needs a human to look at *why* a bound or the formula moved before
+# re-pinning). A diff here is a prompt to find out which of the two
+# happened, never something to silence by regenerating the numbers.
+_PIN_IDS: tuple[str, ...] = ("6900", "5000", "8700", "9000", "3000")
+_PINNED_TOTAL_SCORES: dict[str, float] = {
+    "6900": 0.5797013993974158,  # Kefar Sava (Kfar Saba) — the real #1
+    "5000": 0.5088020762326761,  # Tel Aviv-Yafo
+    "8700": 0.470069013617954,  # Ra'annana
+    "9000": 0.44405899520052206,  # Be'er Sheva
+    "3000": 0.37901548248367817,  # Jerusalem — last of these five
+}
+
+
+def test_real_dataset_scores_are_pinned_to_known_values():
+    """Score five real localities with the REAL DEFAULT_CRITERIA against
+    the REAL committed dataset, and check the total_score of each against
+    a value written into this test by hand (see the comment block above
+    for how it was produced and why a failure here is never something to
+    silence by re-running and copying the new number in).
+    """
+    items = {item_id: dataset.METRICS[item_id] for item_id in _PIN_IDS}
+    result = rank_items(items, DEFAULT_CRITERIA)
+
+    # All five must actually have scored (not landed in `excluded`) —
+    # a coverage-threshold regression that silently dropped one of them
+    # would otherwise make the loop below vacuously pass on four items
+    # instead of failing loudly on the missing fifth.
+    assert result.excluded == ()
+    scored = {r.item_id: r for r in result.ranked}
+    assert set(scored) == set(_PIN_IDS)
+
+    for item_id, expected_score in _PINNED_TOTAL_SCORES.items():
+        # Every pinned locality has full 5/5 criterion coverage in the
+        # real dataset (see the comment above) — asserted here so a
+        # future data gap for one of these specific five (e.g. a future
+        # rental_yield join failure) fails as "coverage changed", a much
+        # clearer signal than a silently-renormalized score that merely
+        # LOOKS like a formula drift.
+        assert scored[item_id].covered_weight == pytest.approx(1.0), (
+            f"{item_id} no longer has full criterion coverage in the real dataset — "
+            "this test's premise (a pure arithmetic/bounds check, with no "
+            "renormalization involved) no longer holds for this locality."
+        )
+        assert scored[item_id].total_score == pytest.approx(expected_score, abs=1e-9), (
+            f"total_score for {item_id!r} drifted from the pinned value {expected_score}. "
+            "This means either the underlying nadlan.gov.il/CBS data for this locality "
+            "changed (re-pin after confirming the new number looks sane) or a "
+            "DEFAULT_CRITERIA bound/weight or scoring.py's formula moved (find out why "
+            "before re-pinning) — see the comment above this test for the full decision "
+            "tree. Never silence this by copying in whatever the code now produces."
+        )
+
+    # The relative ORDER is itself part of what a bounds/formula drift can
+    # break even when no single score moves outside its own tolerance —
+    # e.g. two scores swapping without either one crossing 1e-9 relative
+    # to its OWN old value is not possible here, but a bound shift that
+    # nudges several scores in different directions could still preserve
+    # each one's approx equality while reshuffling the order. Pinning the
+    # order too closes that gap.
+    assert [r.item_id for r in result.ranked] == list(_PIN_IDS)
