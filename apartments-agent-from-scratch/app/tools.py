@@ -9,24 +9,34 @@ value, normalized score, weight, contribution) — never a bare number.
 
 This is also the ONLY module that holds domain judgement. scoring.py has
 the generic weighted ranker, analytics.py the generic filter/aggregate/
-derived-metric contracts, runway_geometry.py the generic airfield
-geometry — none of them know what an airport is worth. The criteria,
-their weights and bounds, and the unmet-demand model all live here, so
-"what did you decide, and why" has one address.
+derived-metric contracts, affordability.py the generic mortgage math —
+none of them know what a "good value" Israeli locality is. The criteria,
+their weights and bounds, the eligibility gate, and the required-income
+model all live here, so "what did you decide, and why" has one address.
 
 Data comes from app/dataset.py (static JSON rebuilt by
-data/refresh_data.py from FAA, OurAirports, US Census and BTS — all
-public, all keyless). The one genuinely live call is FAA NAS Status; it
-is deliberately kept OUT of the scored path, because a ground stop today
-says nothing about whether an airport is worth expanding over a decade.
+data/refresh_data.py from nadlan.gov.il and CBS — all public, all
+keyless). The one genuinely live call is the Bank of Israel's known
+interest rate; it is deliberately kept OUT of the scored path (see
+system_prompt.py rule 7 and get_current_mortgage_rates' own docstring) —
+a rate change moves what every buyer can afford everywhere at once, so
+it says nothing about whether one locality is better VALUE than another.
 """
 from __future__ import annotations
 
+import json
 import urllib.error
 import urllib.request
 from typing import Any, Callable
-from xml.etree import ElementTree
 
+from app import dataset
+from app.affordability import (
+    DEFAULT_MORTGAGE_TERM_YEARS,
+    DEFAULT_REPAYMENT_CAP,
+    FIRST_HOME_MAX_LTV,
+    monthly_payment,
+    years_of_income_to_buy,
+)
 from app.analytics import (
     SUPPORTED_OPERATIONS,
     DerivedMetricResult,
@@ -37,7 +47,6 @@ from app.analytics import (
     known_attribute_keys,
     known_attribute_values,
 )
-from app import dataset
 from app.entity_resolution import resolve
 from app.scoring import (
     PRIORITY_EMPHASIS_FACTOR,
@@ -49,69 +58,181 @@ from app.scoring import (
     sensitivity_analysis,
 )
 
-# ── This assignment's criteria ───────────────────────────────────────────
-# The brief asks where renovation is "most profitable based on INCREASED
-# flight and passenger capacity" — a headroom question, not a size
-# question. Ranking on present-day size answers a different question and
-# puts LAX first regardless of whether expanding LAX returns anything.
+# ─────────────────────────────────────────────────────────────────────────
+# This assignment's criteria: DEFAULT_CRITERIA
+# ─────────────────────────────────────────────────────────────────────────
+# Default score meaning (locked with Roi, see _working/PROGRESS.md): "value
+# for money to live in" — affordability weighed against quality of place.
+# It is NOT an investment-return score and NOT a price forecast.
 #
-# So the two genuinely forward-looking signals carry 50% between them,
-# and the two size-flavoured ones 30%, with absolute_scale alone held to
-# 15%. Sanity check that this works: LAX ranks 67th of 144, not 1st.
+# BOUNDS. Each lower_bound/upper_bound is the 5th/95th percentile of the
+# raw field, measured on the 104 ELIGIBLE localities (linear interpolation,
+# i.e. the "R type 7" method numpy.percentile/statistics use by default),
+# on 2026-08-20. Frozen here as literal constants rather than recomputed
+# per query — a ranking has to be reproducible, and bounds that shift with
+# whatever subset of ids happened to be passed to compare_items would make
+# two runs of the same question silently incomparable (today's top-5 could
+# stop meaning the same thing as last week's top-5 for no reason connected
+# to the places themselves). Criterion.normalize clamps anything outside
+# [lower_bound, upper_bound], so a value outside the measured range (a new
+# data refresh, or a locality this specific query didn't include in the
+# percentile calculation) degrades gracefully to 0 or 1 instead of
+# escaping [0, 1] or crashing.
 #
-# Bounds are the 5th/95th percentile of the ELIGIBLE set, measured
-# 2026-08-18 (capacity_pressure's floor recomputed 2026-08-19 — it had
-# drifted; see DECISIONS.md's final-review entry) and frozen as constants
-# rather than recomputed per query —
-# a ranking has to be reproducible, and bounds that shift with whatever
-# subset was passed in would make two runs silently incomparable.
-# Criterion.normalize clamps anything outside them, so an out-of-range
-# value degrades gracefully instead of escaping [0,1].
+# WEIGHTS. The design intent (see _working/PROGRESS.md's original table)
+# was price_level=30, socioeconomic_level=20, accessibility=20,
+# price_momentum_vs_country=15, rental_yield=15. The FINAL weights below
+# differ from that intent, and they differ because the measured pairwise
+# Pearson correlation matrix on the eligible 104 said to change them, not
+# because of a change of mind:
 #
-# Every one of these is higher_is_better: more growth, more regional
-# demand, more isolation from competitors, more pressure, more scale.
+#                     price_level  socioecon  accessibility  momentum  rental_yield
+#     price_level         1.000      0.666        -0.371     -0.003       -0.391
+#     socioecon            0.666      1.000       -0.168     -0.097       -0.158
+#     accessibility       -0.371     -0.168        1.000      0.020        0.405
+#     momentum            -0.003     -0.097        0.020      1.000       -0.195
+#     rental_yield        -0.391     -0.158         0.405     -0.195        1.000
+#
+#   (pairwise Pearson r, eligible 104, pairwise-complete n where a field
+#   has missing values — see FROZEN BOUNDS table below for each n. Full
+#   measurement recorded in _working/agent-logs/tools-surface.md.)
+#
+#   - socioeconomic_level: 20 -> 15. It correlates r=0.666 with
+#     price_level — by far the strongest pair in the matrix. Expensive
+#     places have richer residents; at the original 20+30=50, HALF the
+#     total weight leaned on two criteria that substantially overlap, so
+#     the score would have partly measured "expensive" twice under two
+#     different names. Held to 15 and DISCLOSED here, not dropped to
+#     zero — the residual (uncorrelated) variance is exactly where the
+#     interesting answers live: somewhere cheap that is ALSO a good
+#     place to live, which is a real and findable thing in this data
+#     (see the actual top-10 this produces — none of them are Tel Aviv).
+#   - price_momentum_vs_country: 15 -> 20. It is the ONLY criterion in
+#     the set with |r| <= 0.10 against every other criterion — genuinely
+#     decorrelated, not just "less correlated". The weight moved from the
+#     criterion that duplicates price_level (socioeconomic_level) to the
+#     one that adds independent information the other four don't carry.
+#   - rental_yield: stays at 15. It DOES partly re-express price_level
+#     (r=-0.391, moderate) — cheaper places tend to have higher yields,
+#     mechanically, since yield is rent/price. It earns its place as an
+#     opportunity-cost check (is the price supported by what the home is
+#     actually worth to live in or rent out, not just speculation), but
+#     it is not raised above 15, because doing so would push in the same
+#     direction price_level already pushes, for the same underlying
+#     reason socioeconomic_level was cut.
+#   - accessibility: unchanged at 20. Its strongest correlation is with
+#     rental_yield (r=0.405, moderate — closer-to-core places tend to
+#     have lower yields, plausibly because their price already prices in
+#     the location premium) and a moderate r=-0.371 with price_level. Not
+#     as extreme as the price_level/socioeconomic_level pair, so left as
+#     originally weighted.
+#   - price_level: unchanged at 30. It stays the largest single weight on
+#     purpose — for most buyers "can I actually afford it" dominates
+#     "how much better is it than the alternative" — and the correlation
+#     evidence argues for CUTTING the criteria that duplicate it, not for
+#     cutting price_level itself.
+#
+# Every criterion is listed with its true statistical direction
+# (higher_is_better), not forced positive the way a "bigger number always
+# wins" convention would — Criterion.normalize already handles a
+# lower-is-better criterion correctly (see scoring.py), so there is no
+# reason to invert the sign here and lose the literal meaning of the raw
+# value.
 DEFAULT_CRITERIA: list[Criterion] = [
-    # Is traffic already rising? FAA's own CY2024->CY2025 change.
-    Criterion(name="traffic_growth", weight=25, lower_bound=-0.07884, upper_bound=0.13817),
-    # Is the region it serves growing? Census county population CAGR,
-    # 2022->2025. The only demand-side signal in the set, and the one
-    # that genuinely decorrelates the ranking from airport size.
-    Criterion(name="regional_demand_growth", weight=25, lower_bound=-0.00250, upper_bound=0.02411),
-    # Can demand escape to another airport? Distance to the nearest
-    # commercial-service competitor, in miles.
-    Criterion(name="catchment_monopoly", weight=20, lower_bound=10.7, upper_bound=100.61),
-    # Passengers per air-carrier runway. Correlates r=0.89 with
-    # absolute_scale — kept because it is the only congestion proxy
-    # available and the LA/Santa-Ana comparison needs one, but held to
-    # 15% and disclosed rather than hidden. See DECISIONS.md [18:20].
-    Criterion(name="capacity_pressure", weight=15, lower_bound=287264.425, upper_bound=7823094.2),
-    # Size of the prize. Deliberately the joint-smallest weight.
-    Criterion(name="absolute_scale", weight=15, lower_bound=564368.0, upper_bound=26519646.05),
+    # Median 4-room price vs. the market: nadlan.gov.il settlement-level
+    # median. LOWER is better — this is the affordability half of "value".
+    Criterion(
+        name="price_level",
+        weight=30,
+        lower_bound=757500.0,
+        upper_bound=3467262.5,
+        higher_is_better=False,
+    ),
+    # Straight-line (haversine) distance to whichever of Tel Aviv /
+    # Jerusalem / Haifa is nearest — a proxy for access to Israel's three
+    # biggest employment cores, computed in data/refresh_data.py, not a
+    # measured commute time. LOWER is better.
+    Criterion(
+        name="accessibility",
+        weight=20,
+        lower_bound=4.617,
+        upper_bound=69.7465,
+        higher_is_better=False,
+    ),
+    # Local 5-year price CAGR minus the NATIONAL 5-year price CAGR — is
+    # this place gaining or losing ground on the market as a whole, not
+    # just "are prices rising" (almost everywhere's are). HIGHER is
+    # better, and this is the one criterion that is genuinely
+    # decorrelated from all four others (see the matrix above).
+    Criterion(
+        name="price_momentum_vs_country",
+        weight=20,
+        lower_bound=-0.038353,
+        upper_bound=0.053857,
+        higher_is_better=True,
+    ),
+    # CBS Socio-Economic Index cluster, 1 (lowest) to 10 (highest) — a
+    # broad index blending income, education and employment. HIGHER is
+    # better. Cut from the original 20 to 15 (see the correlation
+    # discussion above) because of its r=0.666 overlap with price_level.
+    Criterion(
+        name="socioeconomic_level",
+        weight=15,
+        lower_bound=2.0,
+        upper_bound=9.0,
+        higher_is_better=True,
+    ),
+    # Annual rent as a percentage of purchase price (nadlan.gov.il's own
+    # yield index). HIGHER is better — the opportunity-cost check: is the
+    # price supported by what the home is worth to actually live in or
+    # rent out, not just appreciation speculation.
+    Criterion(
+        name="rental_yield",
+        weight=15,
+        lower_bound=2.1325,
+        upper_bound=3.776,
+        higher_is_better=True,
+    ),
 ]
 
-# Plain-language gloss for each criterion, condensed from the comments
-# above. Kept as a separate dict rather than a field on Criterion because
-# scoring.py's docstring requires that dataclass shape to stay identical
-# stable — this is domain text, not scoring logic.
+# Plain-language gloss for each criterion, in words a first-time buyer
+# could follow with no statistics background — condensed from the design
+# comments above, but written for the tool's CALLER (the LLM, and through
+# it the user), not for a future maintainer reading the source. Kept as a
+# separate dict rather than a field on Criterion, same reasoning as the
+# airport-domain build this replaces: scoring.py's dataclass shape must
+# stay domain-free, and this is domain text, not scoring logic.
 CRITERION_DESCRIPTIONS: dict[str, str] = {
-    "traffic_growth": "Year-over-year passenger traffic growth (FAA CY2024->CY2025 change).",
-    "regional_demand_growth": (
-        "Growth of the population and economic activity in the airport's home region "
-        "(Census county population CAGR, 2022->2025) — the only demand-side signal, and "
-        "the one that decorrelates the ranking from raw airport size."
+    "price_level": (
+        "How expensive a typical 4-room home is here, compared with every other eligible "
+        "place in Israel. Cheaper scores better — this is the single biggest factor in "
+        "'value for money' here, and it carries the largest weight (30) for that reason."
     ),
-    "catchment_monopoly": (
-        "Distance to the nearest commercial-service competitor airport, in miles — how "
-        "much local demand could otherwise escape to a rival airport."
+    "accessibility": (
+        "Straight-line distance to whichever of Tel Aviv, Jerusalem, or Haifa is closer — "
+        "a stand-in for how far this place is from Israel's three biggest job markets. "
+        "Closer scores better. This is a straight-line distance, not a measured commute "
+        "time, so it can understate the real commute where roads or rail don't run direct."
     ),
-    "capacity_pressure": (
-        "Passengers per air-carrier runway, a congestion proxy. Correlates with "
-        "absolute_scale (r=0.89), so held to a smaller weight on purpose."
+    "price_momentum_vs_country": (
+        "Whether prices here have grown faster or slower than the NATIONAL average over "
+        "the last 5 years, not just whether they went up (almost everywhere's did). "
+        "Growing faster than the country scores better. This is the one factor in the "
+        "ranking that has almost nothing to do with the other four, so it's weighted at "
+        "20 to make sure it actually moves the answer rather than being drowned out."
     ),
-    "absolute_scale": (
-        "Current passenger volume — the size of the prize. Deliberately the "
-        "joint-smallest weight: being large today is not evidence that expanding "
-        "returns anything."
+    "socioeconomic_level": (
+        "The CBS government's own socioeconomic ranking of the area, from 1 (lowest) to "
+        "10 (highest) — a broad measure of local income, education, and employment. "
+        "Higher scores better. It's held to a lower weight (15, not 20) than you might "
+        "expect, because expensive places and high-ranked places are largely the SAME "
+        "places here — weighting both heavily would count that fact twice."
+    ),
+    "rental_yield": (
+        "Annual rent as a percentage of the purchase price. Higher scores better — a "
+        "high yield means the price is backed by what the home is actually worth to live "
+        "in or rent out today, rather than a bet that it will simply keep getting more "
+        "expensive."
     ),
 }
 
@@ -120,51 +241,74 @@ class UnknownItemError(KeyError):
     pass
 
 
-def _unknown_airport(item_id: str) -> UnknownItemError:
-    """One error message shape for every 'no such airport' case. Names a
-    few real ids rather than dumping 515, and points at resolve_entity —
-    the model's next move should be to resolve the name, not to guess
-    another code."""
+def _unknown_item(item_id: str) -> UnknownItemError:
+    """One error message shape for every 'no such locality' case. Names a
+    few real ids rather than dumping all 104, and points at
+    resolve_entity — the model's next move should be to resolve the name,
+    never to guess another id or reconstruct one from memory (see
+    system_prompt.py's NEVER_INVENT_IDS_RULE)."""
+    sample = ", ".join(list(dataset.LOCALITIES)[:5])
     return UnknownItemError(
-        f"unknown airport id={item_id!r}. Ids are FAA LocIDs (usually the IATA code): "
-        f"e.g. {', '.join(list(dataset.AIRPORTS)[:5])}. "
-        "Call resolve_entity first to turn a name or city into an id."
+        f"unknown locality id={item_id!r}. Ids are CBS locality codes, e.g. {sample}. "
+        "Call resolve_entity first to turn a name (Hebrew, English, or a transliteration) "
+        "into an id — never guess or invent one."
     )
 
 
 def fetch_item_metrics(item_id: str) -> dict[str, float]:
-    """Raw criterion inputs for one airport, straight from the built
-    dataset. Any criterion the airport has no data for is simply absent —
-    scoring.py renormalizes each item's weights over what IS present, so
-    a gap costs that airport the criterion, not the whole ranking."""
+    """Raw criterion inputs for one locality, straight from the built
+    dataset. Any criterion the locality has no data for is simply absent
+    — scoring.py renormalizes each item's weights over what IS present,
+    so a gap (e.g. socioeconomic_cluster: 102/104, rental_yield: 98/104 —
+    see LOCALITIES_META['join_coverage']) costs that locality the one
+    criterion, not the whole ranking."""
     if item_id not in dataset.METRICS:
-        raise _unknown_airport(item_id)
+        if item_id in dataset.NEIGHBORHOODS:
+            raise _neighborhood_not_rankable(item_id)
+        raise _unknown_item(item_id)
     return dict(dataset.METRICS[item_id])
+
+
+def _neighborhood_not_rankable(item_id: str) -> UnknownItemError:
+    """A NEIGHBORHOOD id was handed to something that expects a
+    LOCALITY. See _gate_ids' docstring for why this is a distinct error
+    from 'unknown id' — a neighborhood is a real, known thing, just not
+    the kind of thing this tool ranks."""
+    parent_id = dataset.NEIGHBORHOODS[item_id].get("parent_id")
+    parent_name = dataset.LOCALITIES.get(parent_id, {}).get("name_en", parent_id)
+    return UnknownItemError(
+        f"{item_id!r} is a NEIGHBORHOOD, not a locality — nadlan.gov.il and CBS both publish "
+        "socioeconomic/accessibility/income figures at the LOCALITY level only, so a "
+        "neighborhood has no data of its own to rank or fetch metrics for. Its parent "
+        f"locality is {parent_id!r} ({parent_name}). To ask about this neighborhood, use "
+        f"aggregate_records({parent_id!r}, ...) — it answers questions about how a locality's "
+        "neighborhoods compare to each other, which is the shape of question a neighborhood "
+        "id actually supports here."
+    )
 
 
 # ── OpenAI-style tool schemas (Anthropic provider converts these; see
 #    app/providers/llm/anthropic_llm.py) ────────────────────────────────────
+_CRITERION_NAMES: list[str] = [c.name for c in DEFAULT_CRITERIA]
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "compare_items",
             "description": (
-                "Fetch metrics for the given item ids and rank them using the "
-                "deterministic scoring function. Returns, for every ranked "
-                "item, its total score and a per-criterion breakdown (raw "
-                "value, normalized score, weight, contribution), plus a "
-                "separate 'excluded' list of items that had too little data "
-                "to score fairly (see covered_weight/missing_criteria on "
-                "each) — mention exclusions to the user rather than ignoring "
-                "them. Always call this tool for any ranking or comparison "
-                "question — never estimate or guess a score or ranking "
-                "yourself. Airports below FAA primary-airport hub class "
-                "(L/M/S) are automatically set aside and returned in "
-                "'ineligible' — percentage growth on a tiny base is not an "
-                "investment signal. When 'ineligible' is non-empty, tell the "
-                "user which airports were set aside and why; do not present a "
-                "silently shortened list."
+                "Fetch metrics for the given locality ids and rank them using the "
+                "deterministic scoring function. Returns, for every ranked locality, its "
+                "total score and a per-criterion breakdown (raw value, normalized score, "
+                "weight, contribution), plus a separate 'excluded' list of localities that "
+                "had too little data to score fairly (see covered_weight/missing_criteria "
+                "on each) — mention exclusions rather than ignoring them. Always call this "
+                "tool for any ranking or comparison question — never estimate or guess a "
+                "score yourself. A NEIGHBORHOOD id (rather than a locality id) is "
+                "automatically set aside and returned in 'ineligible' with a reason — "
+                "neighborhoods have no socioeconomic/accessibility/income data of their "
+                "own to rank on. When 'ineligible' is non-empty, tell the user which ids "
+                "were set aside and why; do not present a silently shortened list."
             ),
             "parameters": {
                 "type": "object",
@@ -173,36 +317,29 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Airport ids to compare — FAA LocIDs, usually the IATA "
-                            "code, e.g. ['LAX', 'SNA']. Use resolve_entity or "
-                            "find_items to obtain these; do not type them from memory."
+                            "Locality ids to compare — CBS locality codes, e.g. "
+                            "['5000', '3000']. Use resolve_entity or find_items to obtain "
+                            "these; do not type them from memory."
                         ),
                     },
                     "focus_criterion": {
                         "type": "string",
-                        "enum": [
-                            "traffic_growth",
-                            "regional_demand_growth",
-                            "catchment_monopoly",
-                            "capacity_pressure",
-                            "absolute_scale",
-                        ],
+                        "enum": _CRITERION_NAMES,
                         "description": (
-                            "OMIT THIS BY DEFAULT. Any question about which airports are "
-                            "strong/best/promising candidates, about expansion, about "
-                            "investment, or any general ranking must leave it unset and "
-                            "use the full weighted score. Set it ONLY when the user "
-                            "explicitly names a single measurable dimension and asks to "
-                            "compare on that dimension. 'Compare their congestion levels' -> "
-                            "capacity_pressure. 'Which is growing faster' -> "
-                            "traffic_growth. 'Which is bigger' -> absolute_scale. "
-                            "'Which region is growing' -> regional_demand_growth. "
-                            "'Which has less competition nearby' -> catchment_monopoly. "
-                            "The response then carries a 'focus' block ranking the "
-                            "airports on that criterion alone, with the leader already "
-                            "identified — report that block. Do NOT answer a "
-                            "single-dimension question from total_score: it blends all "
-                            "five criteria and means something different."
+                            "OMIT THIS BY DEFAULT. Any question about which places are the "
+                            "best VALUE, good places to buy, or any general ranking must "
+                            "leave it unset and use the full weighted score. Set it ONLY "
+                            "when the user explicitly names a single measurable dimension. "
+                            "'Which is cheaper' -> price_level. 'Which has the better rental "
+                            "yield' -> rental_yield. 'Which is closer to Tel Aviv' -> "
+                            "accessibility. 'Which is growing faster' -> "
+                            "price_momentum_vs_country. 'Which has the higher socioeconomic "
+                            "level' -> socioeconomic_level. The response then carries a "
+                            "'focus' block ranking the localities on that criterion alone, "
+                            "with the leader already identified — report that block. Do NOT "
+                            "answer a single-dimension question from total_score: it blends "
+                            "all five criteria and measures value-for-money, not any one "
+                            "of them."
                         ),
                     },
                 },
@@ -215,14 +352,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "get_item_metrics",
             "description": (
-                "Fetch raw metrics for ONE airport, with no scoring applied. "
-                "Use this only for a factual question about a single airport. "
-                "Do NOT call it twice to compare two airports — raw metrics "
-                "are on wildly different scales (passengers vs. miles vs. "
-                "percentages) and are not comparable as-is. Any question that "
-                "compares, ranks, or asks which is more congested must go "
-                "through compare_items, which normalizes them and returns "
-                "weighted contributions."
+                "Fetch raw metrics for ONE locality, with no scoring applied. Use this "
+                "only for a factual question about a single locality. Do NOT call it "
+                "twice to compare two localities — raw metrics are on wildly different "
+                "scales (₪ vs. km vs. a 1-10 cluster) and are not comparable as-is. Any "
+                "question that compares, ranks, or asks which is 'better' must go through "
+                "compare_items, which normalizes them and returns weighted contributions."
             ),
             "parameters": {
                 "type": "object",
@@ -236,20 +371,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "list_criteria",
             "description": (
-                "Return the scoring methodology itself: every criterion this agent "
-                "ranks airports on, its weight, and what it measures. Call this for "
-                "any meta-question about HOW the ranking works — 'what criteria/weights "
-                "do you use', 'how is the score calculated', 'what goes into the "
-                "ranking' — never answer that from memory or call it proprietary. "
-                "This is distinct from compare_items, which needs specific airports to "
-                "rank; list_criteria takes none because it describes the method, not a "
-                "result. Takes no arguments."
+                "Return the scoring methodology itself: every criterion this agent ranks "
+                "localities on, its weight, and what it measures. Call this for any "
+                "meta-question about HOW the ranking works — 'what criteria/weights do you "
+                "use', 'how is the score calculated', 'what goes into the ranking' — never "
+                "answer that from memory or call it proprietary; these weights are "
+                "disclosed by design. Distinct from compare_items, which needs specific "
+                "localities to rank; list_criteria takes none because it describes the "
+                "method, not a result. Takes no arguments."
             ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -257,25 +388,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "resolve_entity",
             "description": (
-                "Turn a user's free-text reference to an airport ('LA', "
-                "'Santa Ana', 'Logan', a partial or misspelled name) into "
-                "concrete airport ids. "
-                "ALWAYS call this before compare_items or get_item_metrics "
-                "when the user named something in words rather than giving an "
-                "exact id — never guess or invent an id yourself. Returns "
-                "candidates with a confidence and a per-signal breakdown, plus "
-                "a 'decisive' flag. If decisive is false, you MUST NOT silently "
-                "pick the top candidate: either ask the user which one they "
-                "meant, or state plainly which one you assumed and why before "
-                "continuing. If candidates is empty, say nothing matched — do "
-                "not substitute a similar-sounding item."
+                "Turn a user's free-text reference to a place ('Tel Aviv', 'kiryat ata', "
+                "a Hebrew name, a partial or misspelled name, or a REGION like 'the "
+                "Krayot' or 'Gush Dan') into concrete locality ids. ALWAYS call this "
+                "before compare_items, get_item_metrics, aggregate_records, or "
+                "estimate_derived_metric when the user named something in words rather "
+                "than giving an exact id — never guess or invent an id yourself. Returns "
+                "candidates with a confidence and a per-signal breakdown, plus a "
+                "'decisive' flag. If decisive is false, you MUST NOT silently pick the "
+                "top candidate: either ask the user which one they meant, or state "
+                "plainly which one you assumed and why before continuing. If "
+                "match_type is 'region', the query named an AREA containing several "
+                "localities, not one place — see 'candidates' for all of them and "
+                "'members_not_in_eligible_set' for any real places in that area too small "
+                "to be ranked here. If candidates is empty, say nothing matched — do not "
+                "substitute a similar-sounding place."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The user's own words, e.g. 'Santa Ana' or 'the LA airport'.",
+                        "description": "The user's own words, e.g. 'Kiryat Ata' or 'העיר חיפה'.",
                     }
                 },
                 "required": ["query"],
@@ -287,14 +421,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "find_items",
             "description": (
-                "Find every item matching a set of attribute filters (all "
-                "filters must match — AND, not OR). Use this whenever the user "
-                "describes a GROUP rather than naming airports ('airports in "
-                "New England', 'large hubs in the West'). NEVER list ids from "
-                "memory to build such a group — call this. Returns the "
-                "matching ids plus the attribute keys that actually exist, so "
-                "you can tell the user when they asked about a field the "
-                "dataset doesn't have."
+                "Find every locality matching a set of attribute filters (all filters "
+                "must match — AND, not OR). Use this whenever the user describes a GROUP "
+                "rather than naming localities ('places up north', 'urban localities in "
+                "the Center district'). NEVER list ids from memory to build such a group "
+                "— call this. Returns the matching ids plus the attribute keys that "
+                "actually exist, so you can tell the user when they asked about a field "
+                "the dataset doesn't have."
             ),
             "parameters": {
                 "type": "object",
@@ -302,19 +435,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "filters": {
                         "type": "object",
                         "description": (
-                            "Attribute name -> required value, e.g. "
-                            "{'new_england': 'yes'} or {'region': 'West', "
-                            "'hub_class': 'L'}. Available keys include: state "
-                            "(2-letter), region (Census region — the ONLY "
-                            "values are Northeast/Midwest/South/West/Other; "
-                            "New England is a Census DIVISION, not a region, "
-                            "so match it with the new_england key below, "
-                            "never with region), new_england "
-                            "(yes/no), hub_class (L/M/S/N/None), municipality, "
-                            "weather_constrained (yes/no/unknown -- 'unknown' means the "
-                            "runway geometry could not be measured, NOT that the "
-                            "airport is unconstrained), ranking_eligible "
-                            "(yes/no). Matching is case-insensitive."
+                            "Attribute name -> required value, e.g. {'district': 'North'} "
+                            "or {'locality_type': 'urban'}. Available keys include: "
+                            "district (Jerusalem/North/Haifa/Center/Tel Aviv/South/Judea "
+                            "and Samaria/Unknown — the six official CBS districts plus "
+                            "Judea and Samaria and an Unknown fallback), subdistrict_name "
+                            "(a finer CBS נפה grouping, e.g. 'Sharon', 'Haifa' — NOT the "
+                            "same list as district), subdistrict_code (the raw CBS נפה "
+                            "numeric code as a string), global_type (the Hebrew "
+                            "GLOBAL_TYPE value verbatim), locality_type (urban/Arab/"
+                            "community — the English gloss of global_type). Matching is "
+                            "case-insensitive. If a filter value doesn't match anything, "
+                            "the result tells you the values that actually occur for that "
+                            "key — check that before concluding nothing exists."
                         ),
                         "additionalProperties": {"type": "string"},
                     }
@@ -328,37 +461,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "aggregate_records",
             "description": (
-                "Compute a deterministic aggregate (share, mean, count, sum) "
-                "over ONE item's sub-records, optionally restricted to a "
-                "category. This is the tool for single-entity statistics like "
-                "'what percentage of flights out of Anchorage are long haul?' — "
-                "that is NOT a ranking question, so do not use compare_items "
-                "for it. Departure-mix records exist for Anchorage (ANC) only; "
-                "for any other airport this tool reports that no record-level "
-                "data exists, which you must relay rather than estimating. "
-                "The 'category' argument must be one of the dataset's OWN "
-                "category values, not the user's phrasing: call with no "
-                "category first to see 'known_categories' and "
-                "'category_semantics', then call again with a real one. If "
-                "'unknown_category' comes back true you asked for something "
-                "that does not exist — that is NOT a zero result and you must "
-                "never report it as 0%. Always relay 'category_semantics' when "
-                "it says the figure is a proxy. "
-                "'share' is computed on units/magnitude; the record counts are "
-                "returned too, so if the user meant share-by-count you can give "
-                "that instead. Never compute a percentage yourself."
+                "Compute a deterministic aggregate (share, mean, count, sum) over ONE "
+                "locality's own NEIGHBORHOODS, optionally restricted to a category. This "
+                "is the tool for single-locality statistics like 'what share of Tel "
+                "Aviv's neighborhoods are above the city median price?' — that is NOT a "
+                "ranking question, so do not use compare_items for it. Only priced "
+                "neighborhoods are counted in the numerator AND denominator here — a "
+                "locality can have neighborhoods nadlan.gov.il tracks but never priced, "
+                "and this tool reports that count honestly (see "
+                "'neighborhoods_without_price_data') rather than pretending the priced "
+                "subset is the whole picture. The 'category' argument must be one of the "
+                "dataset's OWN category values, not the user's phrasing: call with no "
+                "category first to see 'known_categories' and 'category_semantics', then "
+                "call again with a real one. If 'unknown_category' comes back true you "
+                "asked for something that does not exist — that is NOT a zero result and "
+                "you must never report it as 0%. Always relay 'category_semantics'. "
+                "'share' is computed on units (a share BY COUNT of neighborhoods); the "
+                "record counts are returned too. Never compute a percentage yourself."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "item_id": {"type": "string"},
-                    "operation": {
-                        "type": "string",
-                        "enum": list(SUPPORTED_OPERATIONS),
-                    },
+                    "operation": {"type": "string", "enum": list(SUPPORTED_OPERATIONS)},
                     "category": {
                         "type": "string",
-                        "description": "Optional record category, e.g. 'international' or 'domestic'.",
+                        "description": (
+                            f"Optional record category — one of {list(dataset.KNOWN_NEIGHBORHOOD_CATEGORIES)}."
+                        ),
                     },
                 },
                 "required": ["item_id", "operation"],
@@ -370,19 +500,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "estimate_derived_metric",
             "description": (
-                "Estimate a MODELLED quantity that exists in no dataset — "
-                "currently 'unmet_demand' — and return it with the contributing "
-                "factors, their magnitudes, the model's assumptions, a "
-                "confidence level, and a caveat. Use this for 'what is the "
-                "unmet demand at X, and why?'-shaped questions. The two factors "
-                "are weather-suppressed throughput (parallel runways too close "
-                "to fly independently in low visibility, so arrival capacity "
-                "collapses) and structural capacity deficit (demand projected "
-                "forward exceeds good-weather runway capacity). When explaining "
-                "the 'why', use ONLY the returned factors and their magnitudes; "
-                "never invent a cause. Always report the confidence and caveat "
-                "— this is a model output, not an observation, and presenting "
-                "it as a measured fact is wrong."
+                "Estimate the MODELLED monthly household income needed to buy this "
+                "locality's median 4-room home under standard Israeli mortgage terms, "
+                "with the contributing factors, assumptions, a confidence level, and a "
+                "caveat. This quantity exists in no dataset — it is built from "
+                "app/affordability.py's mortgage arithmetic, not looked up. Use this for "
+                "'what income do you need to buy here, and why?'-shaped questions. When "
+                "explaining the 'why', use ONLY the returned factors and their "
+                "magnitudes; never invent a cause. Always report the confidence and "
+                "caveat — this is a model output, not a measurement. IMPORTANT: the "
+                "result also compares the required income against this locality's ACTUAL "
+                "median household income, but that income figure is from a 2021 CBS "
+                "survey while prices are current — always relay the vintage-mismatch "
+                "caveat when you state that comparison; it means today's true burden is "
+                "understated, never overstated, by this figure."
             ),
             "parameters": {
                 "type": "object",
@@ -396,17 +527,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "rank_by_priorities",
             "description": (
-                "Rank items with the weighting adjusted to priorities the user "
-                "stated in their own words ('I care about being fast and "
-                "cheap', 'quality matters most, budget is flexible'). Map their "
-                "words onto criterion NAMES and pass those; you do not choose "
-                "how much to reweight — the tool applies a fixed factor. "
-                "Returns BOTH the default ranking and the adjusted one, plus an "
-                "'assumption_to_state' string. You MUST tell the user which "
-                "criteria you emphasized and that it reflects your reading of "
-                "their words — never present a reweighted ranking as if it were "
-                "the neutral one. If the user states priorities but names no "
-                "items, call find_items or ask which items they mean first."
+                "Rank localities with the weighting adjusted to priorities the user "
+                "stated in their own words ('I care about a short commute and don't mind "
+                "paying more', 'cheapest place that isn't declining'). Map their words "
+                "onto criterion NAMES and pass those; you do not choose how much to "
+                "reweight — the tool applies a fixed factor. Returns BOTH the default "
+                "ranking and the adjusted one, plus an 'assumption_to_state' string. You "
+                "MUST tell the user which criteria you emphasized and that it reflects "
+                "your reading of their words — never present a reweighted ranking as if "
+                "it were the neutral one. If the user states priorities but names no "
+                "localities, call find_items or ask which places they mean first."
             ),
             "parameters": {
                 "type": "object",
@@ -414,17 +544,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "item_ids": {"type": "array", "items": {"type": "string"}},
                     "emphasize": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Criterion names the user cares MORE about, e.g. "
-                            "['traffic_growth', 'regional_demand_growth']. Valid names: "
-                            "traffic_growth, regional_demand_growth, catchment_monopoly, "
-                            "capacity_pressure, absolute_scale."
-                        ),
+                        "items": {"type": "string", "enum": _CRITERION_NAMES},
+                        "description": "Criterion names the user cares MORE about.",
                     },
                     "deemphasize": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "enum": _CRITERION_NAMES},
                         "description": "Criterion names the user cares LESS about.",
                     },
                 },
@@ -437,19 +562,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "analyze_weight_sensitivity",
             "description": (
-                "Re-rank the given items with ONE criterion's weight scaled by "
-                "a factor, and report what moved: whether the winner changed, "
-                "how far each item shifted, and a Kendall tau rank-correlation "
-                "(1.0 = order unchanged). Call this when the user asks why a "
-                "weight was chosen, what happens if it's wrong, or how "
-                "sensitive the ranking is. Report the result honestly even "
-                "when it shows the ranking is fragile."
+                "Re-rank the given localities with ONE criterion's weight scaled by a "
+                "factor, and report what moved: whether the winner changed, how far each "
+                "locality shifted, and a Kendall tau rank-correlation (1.0 = order "
+                "unchanged). Call this when the user asks why a weight was chosen, what "
+                "happens if it's wrong, or how sensitive the ranking is. Report the "
+                "result honestly even when it shows the ranking is fragile."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "item_ids": {"type": "array", "items": {"type": "string"}},
-                    "criterion": {"type": "string", "description": "Which criterion's weight to perturb."},
+                    "criterion": {
+                        "type": "string",
+                        "enum": _CRITERION_NAMES,
+                        "description": "Which criterion's weight to perturb.",
+                    },
                     "factor": {
                         "type": "number",
                         "description": "Multiplier on that weight; 0.5 halves it, 2.0 doubles it.",
@@ -464,12 +592,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "weight_robustness_report",
             "description": (
-                "For every criterion, find the smallest weight multiplier that "
-                "would change the top-ranked item. Use this to answer 'how "
-                "confident are you in this ranking?' or 'which weight matters "
-                "most?'. A flip factor near 1.0 means the result hangs on that "
-                "weight and the top items should be described as close rather "
-                "than as a clear winner — say so plainly when that's the case."
+                "For every criterion, find the smallest weight multiplier that would "
+                "change the top-ranked locality. Use this to answer 'how confident are "
+                "you in this ranking?' or 'which weight matters most?'. A flip factor "
+                "near 1.0 means the result hangs on that weight and the top places should "
+                "be described as close rather than as a clear winner — say so plainly "
+                "when that's the case."
             ),
             "parameters": {
                 "type": "object",
@@ -481,33 +609,35 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_live_airport_status",
+            "name": "get_current_mortgage_rates",
             "description": (
-                "Fetch CURRENT operational status for one airport from FAA's "
-                "live NAS Status feed — ground stops, ground delay programs, "
-                "closures, arrival/departure delays. Use this only when the "
-                "user asks what is happening NOW. This is live operational "
-                "colour and is NOT part of the investment score: never present "
-                "a ground delay as evidence for or against expanding an "
-                "airport, and say so if the user conflates them. If "
-                "'available' is false the feed was unreachable — report the "
-                "rest of the answer without it rather than guessing."
+                "Fetch the CURRENT Bank of Israel known interest rate, live, plus an "
+                "estimated Prime-tracked mortgage rate built from it. Use this ONLY to "
+                "answer 'what can I afford right now' or 'what would the payment be at "
+                "today's rate' — it is NOT part of the value-for-money score and must "
+                "never be presented as evidence for or against a particular locality: a "
+                "rate change moves what every buyer can afford everywhere at once, so it "
+                "says nothing about relative value. If 'available' is false the live feed "
+                "was unreachable and a clearly labelled stated-assumption default is "
+                "returned instead — say so plainly if you relay it; never present it as a "
+                "live measurement."
             ),
-            "parameters": {
-                "type": "object",
-                "properties": {"item_id": {"type": "string"}},
-                "required": ["item_id"],
-            },
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
 ]
 
 
-# Two scores this close are the same score. Chosen from the real data
-# rather than picked round: at the final weights the top two airports
-# (Nashville 0.6333, Denver 0.6314) differ by 0.0019, and the winner
-# flips on a 5% change to a single weight — so anything inside this band
-# is a tie the tool has no business breaking silently.
+# Two scores this close are the same score. Chosen from the real data, not
+# picked round: at the final weights the top two localities (Qiryat
+# Motzkin 0.7257, Judeide-Maker 0.7245) differ by only 0.00124, and
+# weight_robustness_report on the full eligible set shows the winner
+# flips at just a 5% change to ANY of price_level, accessibility,
+# socioeconomic_level, or rental_yield (flip factors measured: 1.05,
+# 0.95, 0.95, 1.05) and at a 15% change to price_momentum_vs_country
+# (0.85) — measured 2026-08-21. A difference this small, moved by a
+# weighting change this small, is not a real separation between two
+# places; it is noise relative to the judgement calls that produced it.
 #
 # Same shape as entity_resolution's `decisive` flag, deliberately: a
 # confidence floor plus a required GAP. One convention for "the data does
@@ -529,54 +659,71 @@ def _tie_group(ranked: list[dict[str, Any]]) -> list[str]:
     return tied if len(tied) > 1 else []
 
 
-def _gate_ids(
-    item_ids: list[str], *, include_ineligible: bool = False
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """Split requested ids into (rankable, set-aside-with-a-reason).
+def _gate_ids(item_ids: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Split requested ids into (rankable localities, set-aside-with-a-reason).
 
-    The FAA hub-class gate exists because percentage growth on a
-    near-zero base is not an investment signal. The concrete failure:
-    asked for New England candidates, New Bedford Regional — 3,145
-    passengers a year, +52.7% — came back ranked 4th, ahead of airports
-    a thousand times its size.
+    THE ELIGIBILITY GATE THIS DOMAIN ACTUALLY NEEDS. In the prior
+    (airport) build, this gate excluded small airports by a domain rule
+    (FAA hub class) computed at RANKING TIME. Here that domain rule
+    (locality type + population floor + real deal data — see
+    dataset.LOCALITIES_META['eligibility_rule']) already ran UPSTREAM, in
+    data/refresh_data.py: every id in dataset.LOCALITIES has already
+    passed it, so there is no further population/type cut to apply here.
 
-    This lives in one function called by EVERY ranking tool, and that is
-    the whole point. It was originally written inline inside
-    `compare_items`, on the argument that "a filter the caller has to
-    remember is a filter that gets forgotten" — and then three sibling
-    ranking tools were added that did not call it, and each one
-    reproduced the exact failure the gate was written to prevent. The
-    argument was right; it just had not been applied to itself.
+    What IS still this layer's job, and the reason this function exists
+    at all: this dataset carries a SECOND kind of id — 1,394 neighborhood
+    ids (see dataset.py's module docstring on the LOCALITIES/NEIGHBORHOODS
+    split) — that are real, resolvable things but are NOT independently
+    rankable, because nadlan.gov.il and CBS publish
+    socioeconomic/accessibility/income data at the locality level only.
+    A neighborhood id handed to a ranking tool must be rejected with a
+    reason, not silently scored on a sliver of the criteria it has no
+    data for and left to masquerade as a fairly-ranked peer of a city.
 
-    Set-aside airports are RETURNED with a reason, never silently
-    dropped: the user asked about them and is owed an explanation for
-    their absence.
+    THIS LIVES IN ONE FUNCTION CALLED BY EVERY RANKING TOOL, and that is
+    the whole point — carried over verbatim from the prior build's own
+    postmortem: the gate was originally written inline inside
+    compare_items, on the argument that "a filter the caller has to
+    remember is a filter that gets forgotten," and three sibling ranking
+    tools (rank_by_priorities, analyze_weight_sensitivity,
+    weight_robustness_report) were then added that did not call it, each
+    one reproducing the exact failure the gate was written to prevent.
+    The argument was right; it had just never been applied to itself.
+    Enforced here, in all four, and pinned by
+    tests/test_tools_domain.py's test_gate_enforced_in_all_four_ranking_tools.
+
+    Set-aside neighborhoods are RETURNED with a reason, never silently
+    dropped: the user asked about that id and is owed an explanation for
+    its absence. An id that is neither a known locality nor a known
+    neighborhood passes through unchanged — "not in the dataset at all"
+    is a different answer from "a real thing that isn't rankable", and
+    the downstream lookup (fetch_item_metrics) raises the proper
+    unknown-locality error for it instead.
     """
-    if include_ineligible:
-        return list(item_ids), []
-
     eligible_ids = set(dataset.ELIGIBLE_IDS)
     kept: list[str] = []
     ineligible: list[dict[str, Any]] = []
     for item_id in item_ids:
-        # An unknown id passes through rather than being reported as
-        # ineligible — "not in the dataset" is a different answer from
-        # "too small to rank", and the downstream lookup raises a proper
-        # unknown-airport error for it.
-        if item_id in eligible_ids or item_id not in dataset.AIRPORTS:
+        if item_id in eligible_ids or item_id not in dataset.NEIGHBORHOODS:
             kept.append(item_id)
             continue
-        airport = dataset.AIRPORTS[item_id]
+        row = dataset.NEIGHBORHOODS[item_id]
+        parent_id = row.get("parent_id")
+        parent_name = dataset.LOCALITIES.get(parent_id, {}).get("name_en", parent_id)
         ineligible.append(
             {
                 "item_id": item_id,
-                "name": airport.get("name"),
-                "faa_hub_class": airport.get("faa_hub_class"),
-                "enplanements": airport.get("enplanements_cy2025_prelim"),
+                "name_he": row.get("name_he"),
+                "parent_locality_id": parent_id,
+                "parent_locality_name": parent_name,
                 "reason": (
-                    "Below FAA primary-airport hub class (L/M/S). Percentage growth on a "
-                    "base this small is not a meaningful investment signal, so it is "
-                    "excluded from ranking rather than allowed to top it."
+                    "This is a NEIGHBORHOOD id, not a locality id. Neighborhoods have no "
+                    "socioeconomic/accessibility/income data of their own — nadlan.gov.il "
+                    "and CBS both publish those at the locality level only — so ranking "
+                    "one against a city would either fabricate city-level data as if it "
+                    f"were the neighborhood's own, or score it unfairly on a sliver of the "
+                    f"criteria. Use aggregate_records({parent_id!r}, ...) instead to compare "
+                    f"{parent_name}'s neighborhoods to each other."
                 ),
             }
         )
@@ -593,12 +740,14 @@ def _focus_on_criterion(
     component. No new arithmetic, nothing recomputed, so it cannot
     disagree with the main ranking.
 
-    Ordering is by raw_value descending, not by normalized_score, and the
-    distinction matters for a criterion where lower is better: "which is
-    MORE congested" is a question about the raw quantity, not about which
-    airport scores better on it. `higher_is_better` is returned alongside
-    so the reader knows which direction is favourable for investment,
-    which is a separate question from which value is larger.
+    Ordering is by raw_value, in the criterion's own favourable
+    direction (cheapest first for price_level, closest first for
+    accessibility, highest first for the rest) — not by normalized_score
+    — because "which is CHEAPER" is a question about the raw quantity in
+    its natural direction, not about which locality scores better on a
+    0..1 scale. `higher_is_better` is returned alongside so the reader
+    knows which direction is favourable, a separate question from which
+    raw value is larger.
     """
     match = next((c for c in criteria if c.name == criterion_name), None)
     if match is None:
@@ -620,8 +769,8 @@ def _focus_on_criterion(
         if component is None or component["raw_value"] is None:
             # Missing rather than zero. A dropped criterion is renormalized
             # away in the composite; here it has to be said out loud,
-            # because "no data" and "the lowest value" are different
-            # answers to "which is more congested".
+            # because "no data" and "the worst value" are different
+            # answers to "which is cheaper".
             rows.append({"item_id": entry["item_id"], "raw_value": None, "normalized_score": None})
             continue
         rows.append(
@@ -632,8 +781,13 @@ def _focus_on_criterion(
             }
         )
 
+    # Favourable direction: ascending (smallest first) when lower is
+    # better, descending otherwise. reverse=match.higher_is_better puts
+    # the BEST value first either way.
     with_values = sorted(
-        [r for r in rows if r["raw_value"] is not None], key=lambda r: r["raw_value"], reverse=True
+        [r for r in rows if r["raw_value"] is not None],
+        key=lambda r: r["raw_value"],
+        reverse=match.higher_is_better,
     )
     for position, row in enumerate(with_values, start=1):
         row["rank_on_criterion"] = position
@@ -643,15 +797,15 @@ def _focus_on_criterion(
         "criterion": criterion_name,
         "description": CRITERION_DESCRIPTIONS.get(criterion_name, ""),
         "weight_in_total_score": match.weight,
-        "higher_is_better_for_investment": match.higher_is_better,
+        "higher_is_better": match.higher_is_better,
         "ranked_by_this_criterion_alone": with_values,
-        "highest": with_values[0]["item_id"] if with_values else None,
-        "lowest": with_values[-1]["item_id"] if with_values else None,
+        "best": with_values[0]["item_id"] if with_values else None,
+        "worst": with_values[-1]["item_id"] if with_values else None,
         "no_data_for": missing,
         "note": (
-            f"This ordering is on {criterion_name} alone. It is NOT the total expansion score, "
-            f"which blends all {len(criteria)} criteria and answers a different question. Report "
-            f"this ordering, and do not describe total_score as a measure of {criterion_name}."
+            f"This ordering is on {criterion_name} alone. It is NOT the total value-for-money "
+            f"score, which blends all {len(criteria)} criteria and answers a different question. "
+            f"Report this ordering, and do not describe total_score as a measure of {criterion_name}."
         ),
     }
 
@@ -660,47 +814,30 @@ def compare_items(
     item_ids: list[str],
     criteria: list[Criterion] | None = None,
     coverage_threshold: float = 0.5,
-    include_ineligible: bool = False,
     focus_criterion: str | None = None,
 ) -> dict[str, Any]:
-    """Rank the given airports on the deterministic criteria.
+    """Rank the given localities on the deterministic criteria.
 
-    ELIGIBILITY IS ENFORCED HERE, not upstream, and that placement is the
-    point. The gate (FAA hub class L/M/S) exists because percentage growth
-    on a near-zero base is meaningless — but a filter the caller has to
-    remember is a filter that gets forgotten. It was: asked for New
-    England candidates, the model called find_items without the
-    eligibility filter and New Bedford Regional (3,145 passengers, +53%
-    "growth") came back ranked 4th, which is the precise failure the gate
-    was introduced to prevent.
+    ELIGIBILITY IS ENFORCED HERE (via `_gate_ids`), and every sibling
+    ranking tool enforces it too — see `_gate_ids`' docstring for why
+    that duplication is deliberate rather than a shared "call the gate
+    once upstream" design: the prior (airport) build tried the latter
+    and three ranking tools silently skipped it.
 
-    So the ranking tool refuses to rank ineligible airports by default,
-    regardless of how the ids were obtained. They are RETURNED in
-    `ineligible` with a reason rather than silently dropped — the user
-    asked about them and deserves to be told why they are not in the list.
-    `include_ineligible=True` overrides it for a caller who genuinely
-    wants the long tail.
-
-    `focus_criterion` exists because of one specific, observed failure.
-    Asked "compare LA and Santa Ana congestion levels" — a question about
-    ONE dimension, not about which airport is the better investment — the
-    model read the composite `total_score` and reported "LAX has the
-    higher total score, therefore LAX is more congested." Both halves of
-    that sentence are true and the conclusion is false: `total_score` is a
-    weighted blend of five criteria, only one of which is the congestion
-    proxy. Two rounds of system-prompt instruction did not stop it.
-
-    The fix is the same principle the rest of this file runs on: if the
-    model keeps deriving a wrong answer, stop asking it to derive one.
-    With `focus_criterion` set, the tool returns a `focus` block that
-    ranks the items on that criterion ALONE, already ordered, with the
-    leader named. The model reports it instead of inferring it — the same
-    reason every other tool here returns a per-component breakdown rather
-    than a bare number.
+    `focus_criterion` exists for the same reason it did in the prior
+    build: asked a single-dimension question ("which is cheaper"), a
+    model reading only `total_score` will report the wrong answer with
+    perfect internal consistency, because total_score is a five-way
+    blend and only one of the blended criteria is the one dimension that
+    was actually asked about. With `focus_criterion` set, the tool
+    returns a `focus` block that ranks the localities on that criterion
+    ALONE, already ordered, with the leader named — the model reports it
+    instead of inferring it, same reason every other tool here returns a
+    per-component breakdown rather than a bare number.
     """
     criteria = criteria or DEFAULT_CRITERIA
 
-    item_ids, ineligible = _gate_ids(item_ids, include_ineligible=include_ineligible)
+    item_ids, ineligible = _gate_ids(item_ids)
 
     items = {item_id: fetch_item_metrics(item_id) for item_id in item_ids}
     result = rank_items(items, criteria, coverage_threshold=coverage_threshold)
@@ -708,6 +845,8 @@ def compare_items(
         {
             "rank": r.rank,
             "item_id": r.item_id,
+            "name_en": dataset.LOCALITIES.get(r.item_id, {}).get("name_en"),
+            "name_he": dataset.LOCALITIES.get(r.item_id, {}).get("name_he"),
             "total_score": round(r.total_score, 4),
             "covered_weight": round(r.covered_weight, 4),
             "missing_criteria": list(r.missing_criteria),
@@ -727,9 +866,9 @@ def compare_items(
     tied = _tie_group(ranking)
     # `decisive` answers "is there a clear winner". With nothing ranked
     # there is no winner at all, and `not tied` would report true —
-    # reachable on a real question ("compare these three small regionals"),
-    # where every airport is correctly gated out and the payload then
-    # asserts confidence in a list that does not exist.
+    # reachable on a real question ("compare these two neighborhoods"),
+    # where both ids are correctly gated out and the payload then asserts
+    # confidence in a list that does not exist.
     decisive = bool(ranking) and not tied
     focus = _focus_on_criterion(focus_criterion, ranking, criteria) if focus_criterion else None
     return {
@@ -750,19 +889,20 @@ def compare_items(
         # of reading an empty list as agreement.
         "no_items_ranked": not ranking,
         "tie_threshold": DECISIVE_SCORE_GAP,
-        # Airports the caller asked about that are below FAA primary-airport
-        # hub class. Returned, not silently dropped — tell the user these
-        # were set aside and why, rather than showing a shorter list with no
-        # explanation.
+        # Requested ids that were NEIGHBORHOODS, not localities. Returned,
+        # not silently dropped — tell the user these were set aside and
+        # why, rather than showing a shorter list with no explanation.
         "ineligible": ineligible,
         "ranking": ranking,
-        # Items with SOME data but too little of it to score fairly, per
-        # coverage_threshold — surfaced explicitly rather than silently dropped,
-        # so the LLM can tell the user "N excluded, here's why" instead of
-        # producing a ranking that quietly omits them with no explanation.
+        # Localities with SOME data but too little of it to score fairly,
+        # per coverage_threshold — surfaced explicitly rather than
+        # silently dropped, so the model can tell the user "N excluded,
+        # here's why" instead of producing a ranking that quietly omits
+        # them with no explanation.
         "excluded": [
             {
                 "item_id": e.item_id,
+                "name_en": dataset.LOCALITIES.get(e.item_id, {}).get("name_en"),
                 "covered_weight": round(e.covered_weight, 4),
                 "missing_criteria": list(e.missing_criteria),
                 "reason": e.reason,
@@ -770,15 +910,22 @@ def compare_items(
             for e in result.excluded
         ],
         # Present only when the caller asked about one dimension. See the
-        # docstring: this is the answer to "who is more congested",
-        # computed here so the model never has to derive it from the
-        # composite score, which does not mean that.
+        # docstring: this is the answer to "which is cheaper", computed
+        # here so the model never has to derive it from the composite
+        # score, which does not mean that.
         "focus": focus,
     }
 
 
 def get_item_metrics(item_id: str) -> dict[str, Any]:
-    return {"item_id": item_id, "metrics": fetch_item_metrics(item_id)}
+    metrics = fetch_item_metrics(item_id)  # raises _unknown_item / _neighborhood_not_rankable
+    row = dataset.LOCALITIES[item_id]
+    return {
+        "item_id": item_id,
+        "name_en": row.get("name_en"),
+        "name_he": row.get("name_he"),
+        "metrics": metrics,
+    }
 
 
 def list_criteria() -> dict[str, Any]:
@@ -803,17 +950,31 @@ def list_criteria() -> dict[str, Any]:
             }
             for c in DEFAULT_CRITERIA
         ],
+        "score_meaning": (
+            "The default score answers 'where is a home good value to live in' — it weighs "
+            "what a place costs against what you get for it, rather than rewarding expensive "
+            "places for being expensive. It is NOT an investment-return score and it is not a "
+            "prediction of future prices."
+        ),
         "note": (
-            "These are the default weights, applied unless the user's own stated "
-            "priorities lead you to call rank_by_priorities instead — that "
-            "reweights per-query, it does not change these defaults."
+            "These are the default weights, applied unless the user's own stated priorities "
+            "lead you to call rank_by_priorities instead — that reweights per-query, it does "
+            "not change these defaults."
         ),
     }
 
 
 def resolve_entity(query: str) -> dict[str, Any]:
-    """Free-text name -> candidate item ids, with confidence and a
+    """Free-text name -> candidate locality ids, with confidence and a
     decisive/ambiguous verdict.
+
+    A REGION is not a failed locality match — it is a DIFFERENT kind of
+    answer ("the Krayot" names four localities, not one), and collapsing
+    it to a single "best-matching" locality would silently decide
+    something the user didn't ask. Checked first, via
+    dataset.resolve_region, and returned as an explicitly non-decisive
+    result (match_type='region') so the model has to say which reading
+    it took — see system_prompt.py rule 8.
 
     Zero matches is a normal outcome of a fuzzy search, not a caller
     mistake, so it comes back as an empty candidate list with
@@ -821,33 +982,35 @@ def resolve_entity(query: str) -> dict[str, Any]:
     with fetch_item_metrics's UnknownItemError, where being handed an id
     that doesn't exist really is a bug worth naming loudly.
     """
-    # A metro name is not a failed airport match — it is a DIFFERENT kind
-    # of answer, and collapsing it to the busiest airport would silently
-    # decide something the user didn't. Checked first, and returned as an
-    # explicitly non-decisive result so the model has to say which
-    # reading it took.
-    metro = dataset.resolve_metro(query)
-    if metro is not None:
-        name, ids = metro
+    region = dataset.resolve_region(query)
+    if region is not None:
         return {
             "query": query,
             "decisive": False,
-            "match_type": "metro_area",
-            "metro_name": name,
+            "match_type": "region",
+            "region_name": region["region_name"],
             "candidates": [
                 {
-                    "item_id": i,
-                    "matched_text": name,
+                    "item_id": item_id,
+                    "matched_text": region["region_name"],
                     "confidence": 1.0,
-                    "signals": {"metro_area_member": 1.0},
+                    "signals": {"region_member": 1.0},
+                    "name_en": dataset.LOCALITIES.get(item_id, {}).get("name_en"),
                 }
-                for i in ids
+                for item_id in region["item_ids"]
             ],
+            # Real places that belong to this region but did not survive
+            # the dataset's eligibility gate (too small, or a co-op
+            # housing type) — e.g. Efrat in Gush Etzion. Reported, not
+            # silently dropped, same principle as `ineligible` in _gate_ids.
+            "members_not_in_eligible_set": region["members_not_in_eligible_set"],
             "clarification_required": (
-                f"{query!r} names a metropolitan area with {len(ids)} commercial airports "
-                f"({', '.join(ids)}), not a single airport. State which reading you are using — "
-                f"the primary airport ({ids[0]}) or the whole metro — before answering, or ask "
-                "the user which they meant. Do not silently pick one."
+                f"{query!r} names the {region['region_name']} area, containing "
+                f"{len(region['item_ids'])} eligible localities, not a single place. State "
+                "plainly which reading you are using (all of them, or one in particular) "
+                "before answering — do not silently pick one. Prefer answering with a "
+                "stated assumption over stopping to ask, unless the choice would "
+                "materially change the answer (see system_prompt.py rule 8)."
             ),
         }
 
@@ -855,13 +1018,14 @@ def resolve_entity(query: str) -> dict[str, Any]:
     return {
         "query": result.query,
         "decisive": result.decisive,
-        "match_type": "airport",
+        "match_type": "locality",
         "candidates": [
             {
                 "item_id": c.item_id,
                 "matched_text": c.matched_text,
                 "confidence": c.confidence,
                 "signals": dict(c.signals),
+                "name_en": dataset.LOCALITIES.get(c.item_id, {}).get("name_en"),
             }
             for c in result.candidates
         ],
@@ -869,15 +1033,15 @@ def resolve_entity(query: str) -> dict[str, Any]:
 
 
 def find_items(filters: dict[str, str]) -> dict[str, Any]:
-    """Attribute filter -> matching ids. Also returns the attribute keys
-    that actually exist, so an unknown field reads as "there is no such
-    field" rather than as "nothing matched" — those are different
-    answers and conflating them misleads the user.
+    """Attribute filter -> matching locality ids. Also returns the
+    attribute keys that actually exist, so an unknown field reads as
+    "there is no such field" rather than as "nothing matched" — those are
+    different answers and conflating them misleads the user.
 
     On an empty result it additionally returns the values each filtered
     key actually takes, because a known key with an unknown VALUE is a
-    third distinct answer that used to be indistinguishable from the
-    second. See the comment on the empty-result branch below."""
+    third distinct answer that would otherwise be indistinguishable from
+    the second. See the comment on the empty-result branch below."""
     matched = filter_items(dataset.ATTRIBUTES, filters)
     known_keys = known_attribute_keys(dataset.ATTRIBUTES)
     unknown_keys = [k for k in filters if k.casefold() not in known_keys]
@@ -893,120 +1057,178 @@ def find_items(filters: dict[str, str]) -> dict[str, Any]:
     }
 
     # A known KEY carrying a value the dataset never uses matched nothing,
-    # and "nothing matched" reads as "none exist". Found live on the
-    # brief's own first question: the model called
-    # {'region': 'New England'} — `region` is a real key, but it holds
-    # Census REGIONS (Northeast/Midwest/South/West) and New England is a
-    # Census DIVISION — got zero rows, and answered "there are no airports
-    # in New England that match." There are 23, under {'new_england':
-    # 'yes'}. Every number in that reply was correct and the reply was
-    # false.
+    # and "nothing matched" reads as "none exist". `district` holds the
+    # six official CBS districts (plus Judea and Samaria and Unknown) —
+    # a caller filtering {'district': 'Sharon'} (a SUBDISTRICT, not a
+    # district) gets zero rows, and reporting that as "there are no
+    # localities in the Sharon" would be false; there are several, under
+    # {'subdistrict_name': 'Sharon'}.
     #
     # Exactly the failure aggregate_records already guards for an unknown
-    # category VALUE; this is that guard applied to a filter value. The
-    # cure is the same: hand back the real value space and forbid the
-    # confident negative, so the model can correct itself in one more turn
-    # instead of confidently reporting an absence.
+    # category VALUE (see its own comment on the same pattern); this is
+    # that guard applied to a filter value.
     if filters and not matched:
         result["known_values_for_filtered_keys"] = known_attribute_values(
             dataset.ATTRIBUTES,
             [k for k in filters if k.casefold() in known_keys],
         )
         result["guidance"] = (
-            "Nothing matched every filter. This is NOT evidence that no such item "
+            "Nothing matched every filter. This is NOT evidence that no such locality "
             "exists — check your VALUES before answering. "
-            "'known_values_for_filtered_keys' lists the values each key you "
-            "filtered on actually takes. If a value you passed is not in that "
-            "list, you filtered on something this dataset never stores (a common "
-            "case: a place name that is a Census DIVISION, like 'New England', "
-            "passed as 'region', which only holds Northeast/Midwest/South/West) — "
-            "call this tool again with a real value, or with the key that does "
-            "express what was asked; 'known_attribute_keys' has the full list. "
-            "Only report that nothing exists after every value you used appears "
-            "in the lists above."
+            "'known_values_for_filtered_keys' lists the values each key you filtered on "
+            "actually takes. If a value you passed is not in that list, you filtered on "
+            "something this dataset never stores (a common case: a SUBDISTRICT name, like "
+            "'Sharon', passed as 'district', which only holds the six official CBS "
+            "districts) — call this tool again with a real value, or with the key that "
+            "does express what was asked; 'known_attribute_keys' has the full list. Only "
+            "report that nothing exists after every value you used appears in the lists "
+            "above."
         )
     return result
 
 
 def aggregate_records(item_id: str, operation: str, category: str | None = None) -> dict[str, Any]:
-    """Single-entity statistic over sub-records. Not a ranking, and
-    deliberately a separate code path from scoring.py — a share is a
-    count over one entity's own rows, with no weights and nothing to
-    normalize."""
-    if item_id not in dataset.RECORDS:
-        if item_id in dataset.AIRPORTS:
-            raise UnknownItemError(
-                f"no record-level departure data for {item_id!r}. BTS publishes per-origin "
-                f"segment summaries for {', '.join(dataset.RECORDS)} only in this dataset; the "
-                "per-route microdata that would cover every airport is TranStats-only and "
-                "bot-blocked. Say so rather than estimating a share."
-            )
-        raise _unknown_airport(item_id)
+    """Single-locality statistic over its own neighborhoods. Not a
+    ranking, and deliberately a separate code path from scoring.py — a
+    share is a count over one locality's own sub-records, with no
+    weights and nothing to normalize.
+
+    DENOMINATOR HONESTY. dataset.RECORDS only contains neighborhoods that
+    HAVE a median_price_4room — 621 of 1,394 nationwide (see
+    dataset.NEIGHBORHOODS_META['counts']). That is the correct set to
+    take a price-comparison share OVER (a neighborhood with no price
+    cannot be compared to the city median at all), but it means
+    `total_records` below is the PRICED count for this locality, not
+    its full neighborhood count. Reporting only that number, with no
+    context, would let "70% of X's neighborhoods are above the median"
+    quietly mean "70% of the 12 we have a price for" when X actually has
+    40 neighborhoods and 28 of them are silently invisible to the
+    question. So every response here also carries
+    total_neighborhoods_tracked and neighborhoods_without_price_data —
+    the real, full denominator situation — never just the priced count
+    dressed up as the total.
+    """
+    if item_id not in dataset.LOCALITIES:
+        if item_id in dataset.NEIGHBORHOODS:
+            raise _neighborhood_not_rankable(item_id)
+        raise _unknown_item(item_id)
 
     records = dataset.RECORDS[item_id]
+    counts = dataset.NEIGHBORHOOD_COUNTS[item_id]
+    total_neighborhoods = counts["total_neighborhoods"]
+    priced_neighborhoods = counts["with_price_data"]
+    name = dataset.LOCALITIES[item_id].get("name_en", item_id)
+
+    # Four distinct outcomes, not two — see
+    # _working/agent-logs/tools-surface.md's gotcha: a locality can (a)
+    # have zero neighborhoods tracked by nadlan.gov.il at all, (b) have
+    # neighborhoods tracked but none of them priced, (c) have some priced
+    # and some not, or (d) not be a locality at all (handled above). (a)
+    # and (b) both mean "no aggregate can be computed here", but for
+    # DIFFERENT reasons, and conflating them with "zero" or with a normal
+    # empty-category result would misrepresent which one is true.
+    if total_neighborhoods == 0:
+        return {
+            "item_id": item_id,
+            "name_en": name,
+            "operation": operation,
+            "category": category,
+            "value": None,
+            "defined": False,
+            "total_neighborhoods_tracked": 0,
+            "neighborhoods_with_price_data": 0,
+            "neighborhoods_without_price_data": 0,
+            "known_categories": [],
+            "unknown_category": False,
+            "guidance": (
+                f"nadlan.gov.il tracks ZERO neighborhoods under {name} at all — this is not a "
+                "priced-vs-unpriced gap, there is no neighborhood-level breakdown for this "
+                "locality in the source data. Say so rather than reporting 0% or 'none are "
+                "above the median', which would misstate a missing breakdown as a real "
+                "measured answer."
+            ),
+        }
+    if priced_neighborhoods == 0:
+        return {
+            "item_id": item_id,
+            "name_en": name,
+            "operation": operation,
+            "category": category,
+            "value": None,
+            "defined": False,
+            "total_neighborhoods_tracked": total_neighborhoods,
+            "neighborhoods_with_price_data": 0,
+            "neighborhoods_without_price_data": total_neighborhoods,
+            "known_categories": [],
+            "unknown_category": False,
+            "guidance": (
+                f"nadlan.gov.il tracks {total_neighborhoods} neighborhood(s) under {name}, but "
+                "NONE of them have their own price data — every summary/price field nadlan "
+                "publishes for them is null. No price-comparison aggregate can be computed. "
+                "Say so rather than reporting 0%, which would read as a measured answer "
+                "rather than an absence of data."
+            ),
+        }
+
     known_categories = sorted({str(r["category"]) for r in records if "category" in r})
 
     # "No such category" and "a real category with zero rows" are DIFFERENT
     # answers, and conflating them is how a tool produces a confident
-    # falsehood. Found by running the brief's own question: the model asked
-    # for category "long haul" (which does not exist here — the categories
-    # are domestic/international), matched nothing, and reported "0% of
-    # flights out of Anchorage are long haul." Every number in that
-    # sentence was correct and the sentence was false.
-    #
-    # Same guard find_items already had via unknown_filter_keys; this is
-    # that idea applied to a category VALUE rather than a filter KEY.
+    # falsehood. Same guard find_items already applies to a filter KEY,
+    # applied here to a category VALUE — see that function's comment for
+    # the original instance of this failure mode.
     unknown_category = category is not None and category.casefold() not in {
         c.casefold() for c in known_categories
     }
     if unknown_category:
         return {
             "item_id": item_id,
+            "name_en": name,
             "operation": operation,
             "category": category,
             "value": None,
             "defined": False,
+            "total_neighborhoods_tracked": total_neighborhoods,
+            "neighborhoods_with_price_data": priced_neighborhoods,
+            "neighborhoods_without_price_data": total_neighborhoods - priced_neighborhoods,
             "known_categories": known_categories,
             "unknown_category": True,
             "category_semantics": dataset.CATEGORY_SEMANTICS.get(item_id),
             "guidance": (
-                f"{category!r} is not a category in this dataset — the available categories are "
-                f"{known_categories}. This is NOT the same as a zero result: do not report "
-                f"'0%' or 'none'. Read 'category_semantics' above: it says which available "
-                "category is the right proxy for what was asked. Call this tool again with that "
-                "category and answer the question — do not stop to ask the user which category "
-                "they want when the semantics already say which one applies. Then state plainly "
-                "that the figure is a proxy and what its limitation is."
+                f"{category!r} is not a category in this dataset — the available categories "
+                f"are {known_categories}. This is NOT the same as a zero result: do not "
+                "report '0%' or 'none'. Read 'category_semantics' above: it says exactly "
+                "what these categories compare. Call this tool again with a real category "
+                "and answer the question."
             ),
         }
 
     # A share needs something to take a share OF. With no category the
     # arithmetic is matching_units / total_units over the SAME set, which
-    # is 1.0 — a confident, fully "defined" 100%.
-    #
-    # This is not hypothetical: the schema tells the model to call this
-    # tool with no category first, to discover what the categories are.
-    # Asked "what percentage of flights out of Anchorage are long haul",
-    # the model follows that instruction, receives value 1.0 with
-    # defined:true and unknown_category:false, and has everything it needs
-    # to answer "100%". Same failure class as the unknown-category guard
-    # above, on the path the tool's own documentation routes through.
+    # is a confident, fully "defined" 100% — not useful, and not what a
+    # caller asking for a bare share meant. This branch exists so the
+    # documented discovery flow (call once with no category to see
+    # known_categories, then call again with a real one) never itself
+    # produces a misleadingly confident number.
     if operation == "share" and category is None:
         return {
             "item_id": item_id,
+            "name_en": name,
             "operation": operation,
             "category": None,
             "value": None,
             "defined": False,
+            "total_neighborhoods_tracked": total_neighborhoods,
+            "neighborhoods_with_price_data": priced_neighborhoods,
+            "neighborhoods_without_price_data": total_neighborhoods - priced_neighborhoods,
             "known_categories": known_categories,
             "unknown_category": False,
             "category_semantics": dataset.CATEGORY_SEMANTICS.get(item_id),
             "guidance": (
                 "A share of everything is 100% by definition, so no value is returned here. "
                 f"This call is for discovery: the categories are {known_categories}. Read "
-                "'category_semantics' to see which one answers the question — including where "
-                "it is a proxy rather than the exact measurement asked for — then call this "
-                "tool again with that category."
+                "'category_semantics' to see exactly what they compare, then call this tool "
+                "again with a real category."
             ),
         }
 
@@ -1023,332 +1245,259 @@ def aggregate_records(item_id: str, operation: str, category: str | None = None)
     is_defined = value == value
     return {
         "item_id": item_id,
+        "name_en": name,
         "operation": result.operation,
         "category": result.group_value,
         "value": round(value, 6) if is_defined else None,
         "defined": is_defined,
+        # The REAL denominator situation — see this function's docstring.
+        "total_neighborhoods_tracked": total_neighborhoods,
+        "neighborhoods_with_price_data": priced_neighborhoods,
+        "neighborhoods_without_price_data": total_neighborhoods - priced_neighborhoods,
         "known_categories": known_categories,
         "unknown_category": False,
-        # How to read these categories in the user's vocabulary, including
-        # where they are a proxy rather than the requested measurement.
+        # What these categories mean, and where the comparison is a proxy
+        # (e.g. a neighborhood priced only on an all-rooms fallback rather
+        # than a true 4-room series) rather than an exact like-for-like.
         "category_semantics": dataset.CATEGORY_SEMANTICS.get(item_id),
         # The arithmetic, exposed — so the model explains a number it
         # never computed, same contract as compare_items' components.
+        # matching_records/total_records here are counts over the PRICED
+        # subset only (dataset.RECORDS), i.e. total_records ==
+        # neighborhoods_with_price_data, never the full neighborhood count.
         "matching_records": result.matching_records,
         "total_records": result.total_records,
         "matching_units": result.matching_units,
         "total_units": result.total_units,
-        # The other reading of "what percentage", so the model can offer
-        # it if the user meant share-by-count rather than share-by-volume.
+        # The other reading of "what share", so the model can offer it if
+        # the user meant something other than a share by neighborhood count
+        # (both readings are the same here, since each record's `units` is
+        # a constant 1.0 — a share BY count of priced neighborhoods).
         "share_by_record_count": (
             round(result.matching_records / result.total_records, 6) if result.total_records else None
         ),
     }
 
 
-# ── The DOMAIN model behind estimate_derived_metric ──────────────────────
-# "Unmet demand at SFO, and why" is the question this exists for, and the
-# "why" is the hard half. A correlation would not survive being asked
-# twice; a mechanism does. So the model is built on a physical, published
-# constraint rather than a fitted relationship.
+# ─────────────────────────────────────────────────────────────────────────
+# The domain model behind estimate_derived_metric: required household
+# income
+# ─────────────────────────────────────────────────────────────────────────
+# "What income do you need to buy the median home here, and why?" is the
+# question this exists for, and it is answered with a MECHANISM (the same
+# amortization arithmetic every bank underwriter actually uses — see
+# app/affordability.py), not a correlation. The required income is not
+# looked up anywhere; it is the income at which the standard
+# repayment-to-income cap is exactly met on a mortgage sized to this
+# locality's own median 4-room price.
 #
-# THE MECHANISM. SFO's two parallel arrival runways (28L/28R) sit about
-# 750 ft apart — computed, not looked up: app/runway_geometry.py measures
-# 746.8 ft from OurAirports' published runway-end coordinates, against a
-# published figure of 750. FAA requires 2,500 ft for even dependent
-# simultaneous approaches and 4,300 ft for independent ones, so when the
-# marine layer drops the ceiling, SFO's two arrival streams collapse into
-# ONE and its arrival rate roughly halves. The published schedule does
-# not halve. That gap — demand that exists, was scheduled, and physically
-# could not be flown — is the unmet demand, and no amount of terminal
-# construction fixes it.
+# Because this is a MODELLED quantity, every rate/term/ltv/cap input is a
+# documented, overridable assumption (same rule affordability.py's own
+# header states), not a value read live off a feed — see the constant
+# below for why the live Bank of Israel rate is deliberately NOT called
+# from inside this function.
+REQUIRED_INCOME_METRIC = "required_monthly_household_income_for_median_4room_home"
+
+# NOT fetched live from get_current_mortgage_rates, and that is a
+# deliberate design choice, not an oversight: the live call is kept
+# OUTSIDE every scored/modelled path (system_prompt.py rule 7) because a
+# rate change moves what EVERY buyer can afford, everywhere, at once. If
+# this function called it, running estimate_derived_metric on the SAME
+# locality on two different days would return two different required-
+# income figures with nothing about the locality having changed — which
+# would look like new information about the PLACE when it is really just
+# the news cycle. A fixed, dated, stated assumption keeps this tool
+# reproducible, exactly like affordability.py's own DEFAULT_MORTGAGE_TERM_
+# YEARS / DEFAULT_REPAYMENT_CAP conventions.
 #
-# The same computation runs on all 515 airports, which is what makes this
-# a model rather than a fact about SFO with arithmetic wrapped round it.
-# It independently recovers things nobody told it: Denver, deliberately
-# built with runways 2,510+ ft apart, shows ZERO weather degradation;
-# Seattle, whose 16C/16L are 738 ft apart, shows 0.67.
-
-# Practical annual enplanements one arrival stream can sustain. NOT
-# invented — it is the 95th percentile of enplanements-per-arrival-stream
-# actually achieved across the 144 eligible airports (measured
-# 2026-08-18), i.e. "what a very well-utilized comparable airport really
-# does," not a theoretical throughput.
-#
-# The honest caveat: the true maximum observed is San Diego at 12.7M on a
-# single runway — the busiest single-runway commercial airport in the US.
-# Using p95 rather than that maximum is a deliberate conservatism, and it
-# means this model UNDERSTATES how much traffic a constrained airport
-# could theoretically absorb. Stated because the estimate moves roughly
-# linearly with this constant, so it is the first number to push on.
-PRACTICAL_CAPACITY_PER_ARRIVAL_STREAM = 7_800_000.0
-
-# Fraction of the year an airport is in instrument meteorological
-# conditions, i.e. ceiling/visibility low enough that the parallel-runway
-# separation rules above start binding.
-#
-# THIS IS THE MODEL'S WEAKEST INPUT and it is stated first for that
-# reason. It is a single national figure applied uniformly, when the real
-# rate is intensely local — SFO's summer marine layer is a daily
-# morning event, Phoenix is near-permanently clear. Doing this properly
-# means historical METAR ceiling/visibility per airport (aviationweather.gov
-# publishes it, keylessly) and is the single highest-value upgrade to
-# this model. Not built here for time; see ASSUMPTIONS.md.
-IMC_FRACTION = 0.12
-
-# Utilization at or above which an airport is treated as
-# capacity-constrained, meaning observed traffic is being suppressed BY
-# the constraint rather than merely sitting below it.
-CAPACITY_CONSTRAINED_UTILIZATION = 0.85
+# Value: the Bank of Israel known rate observed 2026-08-21 via
+# get_current_mortgage_rates (3.50%), plus the standard ~1.5
+# percentage-point spread Israeli banks price into a Prime-tracked
+# mortgage tranche (מסלול פריים) — the most commonly used variable-rate
+# mortgage track in Israel. This is a citable market convention, not a
+# fitted number, and a real quote from a specific bank on a specific day
+# will differ from it.
+ASSUMED_MORTGAGE_ANNUAL_RATE = 0.05  # 3.50% BOI known rate + 1.5pp Prime spread, stated 2026-08-21
 
 
-def estimate_unmet_demand(
-    enplanements: float,
-    arrival_streams_vmc: int,
-    weather_capacity_degradation: float,
-    traffic_growth: float,
-    regional_demand_growth: float,
-) -> DerivedMetricResult:
-    """Model passenger demand that exists but cannot be flown.
+def estimate_derived_metric(item_id: str) -> dict[str, Any]:
+    """The monthly household income needed to buy this locality's median
+    4-room home, plus the factors that produced it. The number never
+    travels without its assumptions, confidence, and caveat."""
+    if item_id not in dataset.LOCALITIES:
+        if item_id in dataset.NEIGHBORHOODS:
+            raise _neighborhood_not_rankable(item_id)
+        raise _unknown_item(item_id)
 
-    Unmet demand appears in no dataset by construction: nobody records the
-    passenger who was never scheduled, or the flight that was never filed
-    because the slot does not exist. It has to be modelled from observable
-    proxies, with the assumptions travelling attached to the number.
+    row = dataset.LOCALITIES[item_id]
+    median_price = row.get("median_price_4room")
+    if median_price is None:
+        # Never observed in the real data (median_price_4room is
+        # 104/104 — it is a precondition of the eligibility gate itself,
+        # see LOCALITIES_META['eligibility_rule']) but guarded rather
+        # than assumed, since a bare KeyError here would be an opaque
+        # failure for something that should be structurally impossible.
+        raise UnknownItemError(
+            f"{item_id!r} has no median_price_4room in this dataset, so a required-income "
+            "figure cannot be modelled for it. This should not happen for an eligible "
+            "locality — report it as a data problem rather than guessing a price."
+        )
 
-    Two additive terms, each with its own mechanism:
+    ltv = FIRST_HOME_MAX_LTV
+    years = float(DEFAULT_MORTGAGE_TERM_YEARS)
+    rate = ASSUMED_MORTGAGE_ANNUAL_RATE
+    cap = DEFAULT_REPAYMENT_CAP
 
-      1. WEATHER-SUPPRESSED THROUGHPUT. When the ceiling drops, runways
-         too close together to fly independently collapse into a single
-         arrival stream (see runway_geometry.py for the FAA thresholds).
-         Capacity falls; the schedule does not. During that fraction of
-         the year, demand above the degraded capacity cannot be flown.
-         This is SFO's entire story and it is why the answer to "why?"
-         is geometric rather than commercial.
-
-      2. STRUCTURAL CAPACITY DEFICIT. Demand projected one year forward
-         at the airport's own traffic and regional-population growth,
-         minus what its runways can sustain even in perfect weather.
-         Zero for most airports; non-zero only where the airfield is
-         genuinely undersized for its market.
-
-    Self-gating, which is what stops it being arithmetic-for-its-own-sake:
-    an airport with capacity to spare produces max(0, negative) = 0 on
-    BOTH terms. A quiet airport losing half its arrival rate in fog has
-    no unmet demand, correctly, because the remaining half still covers
-    everything that wanted to fly.
-
-    THE OBJECTION TO HAVE AN ANSWER FOR — "isn't that just a capacity
-    ceiling, not demand?" They are the same phenomenon from two sides: the
-    ceiling is the CAUSE, unmet demand the EFFECT measured through it.
-    That is exactly why utilization gates confidence rather than the
-    number: below the constrained threshold the same arithmetic yields a
-    far weaker claim, and the caveat says so.
-    """
-    practical_capacity = arrival_streams_vmc * PRACTICAL_CAPACITY_PER_ARRIVAL_STREAM
-    utilization = enplanements / practical_capacity if practical_capacity else float("nan")
-
-    # Term 1. Capacity while degraded, and the demand that exceeds it,
-    # annualized over the fraction of the year spent in those conditions.
-    degraded_capacity = practical_capacity * (1.0 - weather_capacity_degradation)
-    weather_suppressed = max(0.0, enplanements - degraded_capacity) * IMC_FRACTION
-
-    # Term 2. Growth clamped at zero in both components: a shrinking
-    # airport or a shrinking county is evidence of LESS pressure, and
-    # letting it go negative would quietly credit decline as headroom.
-    projected_demand = (
-        enplanements * (1.0 + max(0.0, traffic_growth)) * (1.0 + max(0.0, regional_demand_growth))
-    )
-    structural_deficit = max(0.0, projected_demand - practical_capacity)
+    principal = median_price * ltv
+    down_payment = median_price - principal
+    payment = monthly_payment(principal, rate, years)
+    required_monthly_income = payment / cap
+    # The two terms below sum to required_monthly_income EXACTLY, by
+    # construction (buffer is defined as the remainder) — this is the
+    # invariant build_derived_metric's own docstring requires: the
+    # factors reconstruct the number, they don't just gesture at it.
+    repayment_cap_buffer = required_monthly_income - payment
 
     contributions = [
         FactorInput(
-            name="weather_suppressed_throughput",
-            magnitude=weather_suppressed,
-            source_field="min_parallel_separation_ft",
+            name="principal_debt_service",
+            magnitude=payment,
+            source_field="median_price_4room",
             explanation=(
-                f"Arrival capacity falls {weather_capacity_degradation:.0%} in low visibility "
-                f"because of parallel-runway separation, applied over the {IMC_FRACTION:.0%} of "
-                "the year assumed to be instrument conditions. Demand above the degraded rate "
-                "in those periods cannot be flown. A physical airfield constraint — terminal "
-                "construction does not change it."
+                f"The mortgage payment itself: {payment:,.0f} ₪/month on a {principal:,.0f} ₪ "
+                f"loan ({ltv:.0%} of the {median_price:,.0f} ₪ median 4-room price, per Bank of "
+                f"Israel Directive 329's first-home LTV ceiling) at an assumed {rate:.1%} annual "
+                f"rate over {years:.0f} years."
             ),
         ),
         FactorInput(
-            name="structural_capacity_deficit",
-            magnitude=structural_deficit,
-            source_field="enplanements_cy2025_prelim",
+            name="repayment_cap_buffer",
+            magnitude=repayment_cap_buffer,
+            source_field="DEFAULT_REPAYMENT_CAP",
             explanation=(
-                f"Demand projected one year forward at this airport's own traffic growth "
-                f"({traffic_growth:+.1%}) and county population growth "
-                f"({regional_demand_growth:+.2%}), minus what {arrival_streams_vmc} arrival "
-                "stream(s) can sustain in good weather. Zero unless the airfield is undersized "
-                "for its market even before weather is considered."
+                f"On top of the payment itself: a bank underwriting to the standard "
+                f"{cap:.0%}-of-income repayment cap requires the borrower's income to be "
+                f"{1 / cap:.2f}x the payment, not merely cover it — this is the extra income "
+                "cushion that underwriting policy demands, not a cost of the loan itself."
             ),
         ),
     ]
 
-    # NaN-safe: an unknown utilization must not read as "constrained".
-    capacity_constrained = (
-        utilization == utilization and utilization >= CAPACITY_CONSTRAINED_UTILIZATION
-    )
-    weather_exposed = weather_capacity_degradation > 0 and weather_suppressed > 0
+    # Compare the modelled requirement against this locality's ACTUAL
+    # income, where it exists. Absent for exactly the 2 of 104 localities
+    # missing a CBS socioeconomic-index row (see
+    # LOCALITIES_META['join_coverage']) — `or 0.0` would silently turn
+    # "no data" into "zero income", so it is tracked explicitly instead,
+    # same discipline scoring.py applies to a missing criterion.
+    actual_monthly_income = row.get("income_per_household_monthly")
+    missing_inputs: list[str] = []
+    income_gap_monthly: float | None = None
+    years_of_income: float | None = None
+    if actual_monthly_income is None:
+        missing_inputs.append("income_per_household_monthly")
+    else:
+        income_gap_monthly = required_monthly_income - actual_monthly_income
+        years_of_income = years_of_income_to_buy(median_price, actual_monthly_income * 12.0)
 
-    if capacity_constrained or weather_exposed:
-        confidence = "medium"
-        caveat = (
-            f"Utilization is {utilization:.0%} of modelled good-weather capacity"
-            + (
-                f", and arrival capacity drops {weather_capacity_degradation:.0%} in low "
-                "visibility because the parallel runways are too close together to fly "
-                "independently. The runway geometry is the mechanism producing this number, "
-                "not a competing explanation for it. "
-                if weather_exposed
-                else ". "
-            )
-            + "This is a LOWER BOUND: demand that was never scheduled because the constraint "
-            "is well known to airlines is invisible here, and so is every passenger who drove "
-            "to a competing airport instead."
+    confidence = "medium"
+    caveat = (
+        f"MODELLED, not measured: assumes a {rate:.1%} annual mortgage rate (Bank of Israel "
+        f"known rate plus the standard Prime-track spread, stated as of 2026-08-21 — a real "
+        f"bank quote will differ), a {years:.0f}-year term, and {ltv:.0%} loan-to-value (BoI "
+        "Directive 329's ceiling for a FIRST home only — a buyer upgrading or investing faces "
+        "a lower LTV ceiling and therefore needs MORE income than this figure, not less)."
+    )
+    if actual_monthly_income is not None:
+        caveat += (
+            " The comparison against this locality's actual median household income is ITSELF "
+            "stale in a specific, one-directional way: that income figure is from the CBS 2021 "
+            "socioeconomic survey while median_price_4room is a live 2026 nadlan.gov.il figure, "
+            "so five years of nominal wage growth are missing from the income side. That means "
+            "this comparison UNDERSTATES how affordable the locality is relative to current "
+            "incomes, i.e. it OVERSTATES the true income gap — never the reverse. State this "
+            "when relaying the comparison."
         )
     else:
         confidence = "low"
-        caveat = (
-            f"Utilization is only {utilization:.0%} of modelled good-weather capacity, below "
-            f"the {CAPACITY_CONSTRAINED_UTILIZATION:.0%} threshold where the airfield plausibly "
-            "binds. Capacity is not this airport's constraint, so this figure should not be "
-            "read as 'traffic we could win by expanding' — route economics, airline network "
-            "decisions or catchment size are the more likely limits. Same arithmetic, much "
-            "weaker claim."
+        caveat += (
+            f" No income_per_household_monthly figure exists for {item_id!r} — it is one of the "
+            "2 of 104 eligible localities the CBS socioeconomic survey does not cover (it is not "
+            "itself a local authority). The required-income figure below cannot be compared "
+            "against this locality's own actual income at all."
         )
 
-    return build_derived_metric(
-        metric="unmet_demand",
-        unit="annual enplanements",
+    result: DerivedMetricResult = build_derived_metric(
+        metric=REQUIRED_INCOME_METRIC,
+        unit="₪/month (household)",
         contributions=contributions,
         assumptions=(
-            f"One arrival stream sustains {PRACTICAL_CAPACITY_PER_ARRIVAL_STREAM:,.0f} annual "
-            "enplanements — the 95th percentile actually achieved across the 144 eligible "
-            "airports, not a theoretical rate. The estimate moves roughly linearly with it.",
-            f"Instrument conditions are assumed to occur {IMC_FRACTION:.0%} of the year, "
-            "uniformly at every airport. This is the weakest input in the model: the real rate "
-            "is intensely local (SFO's summer marine layer vs. Phoenix). Per-airport METAR "
-            "history would fix it.",
-            "Arrival streams are counted from runway geometry alone. Crossing-runway conflicts, "
-            "wake-turbulence spacing, noise curfews and terrain-driven approach restrictions all "
-            "reduce real capacity further, so good-weather capacity here is an UPPER bound — "
-            "which makes the unmet-demand figure a lower bound.",
-            "Demand is projected one year forward. Growth is clamped at zero, so a declining "
-            "airport is never credited with negative unmet demand.",
+            f"{years:.0f}-year mortgage term — the standard Israeli maximum "
+            "(app.affordability.DEFAULT_MORTGAGE_TERM_YEARS).",
+            f"{ltv:.0%} loan-to-value — Bank of Israel Directive 329's ceiling for a FIRST "
+            "home (app.affordability.FIRST_HOME_MAX_LTV); an upgrader or investment buyer "
+            "faces a lower ceiling.",
+            f"{rate:.1%} assumed annual interest rate — Bank of Israel known rate (3.50%, "
+            "observed 2026-08-21) plus the standard ~1.5 percentage-point Prime-track spread "
+            "Israeli banks price in; call get_current_mortgage_rates for today's live rate, "
+            "which this figure does NOT auto-update with (see ASSUMED_MORTGAGE_ANNUAL_RATE's "
+            "own comment for why it is fixed rather than live).",
+            f"{cap:.0%} repayment-to-income cap — standard Israeli bank underwriting "
+            "convention (app.affordability.DEFAULT_REPAYMENT_CAP), not a single published "
+            "regulatory ceiling the way LTV is.",
         ),
         confidence=confidence,
         caveat=caveat,
     )
 
-
-def estimate_derived_metric(item_id: str) -> dict[str, Any]:
-    """A modelled quantity plus the factors that produced it. The number
-    never travels without its assumptions, confidence, and caveat."""
-    if item_id not in dataset.AIRPORTS:
-        raise _unknown_airport(item_id)
-
-    airport = dataset.AIRPORTS[item_id]
-
-    # `or 0.0` cannot tell "absent" from "zero", and this model runs on
-    # ragged public data where both occur. 14 of 515 airports have no
-    # county population figure at all (Puerto Rico and the island
-    # territories, where the Census county join has nothing to join to).
-    # For those the tool used to state "county population growth
-    # (+0.00%)" inside the factor explanation — the exact text the system
-    # prompt tells the model to quote when explaining the "why" — with
-    # nothing anywhere in the payload marking it as absent rather than
-    # measured.
-    #
-    # scoring.py already solves this properly for the ranking path, with
-    # missing_criteria, covered_weight, and renormalization over the
-    # weight that is actually present. That discipline exists; this code
-    # path simply did not participate in it. Tracking the gaps here is
-    # that same rule applied where it was missing.
-    missing_inputs: list[str] = []
-
-    def numeric(field: str, label: str, default: float = 0.0) -> float:
-        raw = airport.get(field)
-        if raw is None or raw == "":
-            missing_inputs.append(label)
-            return default
-        return float(raw)
-
-    inputs = {
-        "enplanements": numeric("enplanements_cy2025_prelim", "enplanements"),
-        "arrival_streams_vmc": int(airport.get("arrival_streams_vmc") or 0),
-        "arrival_streams_imc": int(airport.get("arrival_streams_imc") or 0),
-        "weather_capacity_degradation": numeric(
-            "weather_capacity_degradation", "weather_capacity_degradation"
-        ),
-        "min_parallel_separation_ft": airport.get("min_parallel_separation_ft"),
-        "traffic_growth": numeric("yoy_pct_change_2025", "traffic_growth"),
-        "regional_demand_growth": numeric(
-            "county_population_cagr_recent", "regional_demand_growth"
-        ),
-    }
-    if not inputs["arrival_streams_vmc"]:
-        raise UnknownItemError(
-            f"no usable runway geometry for {item_id!r} (no runway long enough for air-carrier "
-            "arrivals, or missing coordinates), so arrival capacity cannot be modelled. "
-            "The unmet-demand estimate is unavailable for this airport."
-        )
-
-    result = estimate_unmet_demand(
-        enplanements=inputs["enplanements"],
-        arrival_streams_vmc=inputs["arrival_streams_vmc"],
-        weather_capacity_degradation=inputs["weather_capacity_degradation"],
-        traffic_growth=inputs["traffic_growth"],
-        regional_demand_growth=inputs["regional_demand_growth"],
-    )
-    # A modelled number built partly on absent inputs is not the same
-    # number, and must not be presented as one. Confidence is forced
-    # down, the caveat says which inputs were missing, and the payload
-    # carries the list so the model cannot state the figure without also
-    # having the reason to qualify it.
-    confidence = result.confidence
-    caveat = result.caveat
-    if missing_inputs:
-        confidence = "low"
-        caveat = (
-            f"No data for {', '.join(missing_inputs)} at this airport — treated as zero in the "
-            "model, which understates projected demand. Report this estimate as a lower bound "
-            "built on incomplete inputs, and name the missing ones. "
-        ) + (caveat or "")
-
     return {
         "item_id": item_id,
+        "name_en": row.get("name_en"),
         "metric": result.metric,
-        "value": round(result.value, 4),
+        "value": round(result.value, 2),
         "unit": result.unit,
-        "confidence": confidence,
-        "caveat": caveat,
-        # Empty for a fully-measured airport. Non-empty means at least one
-        # number in `observed_inputs` is a stand-in, not a measurement.
+        "confidence": result.confidence,
+        "caveat": result.caveat,
+        # Empty for a fully-measured locality. Non-empty means at least
+        # one number in the comparison below is a stand-in, not a
+        # measurement.
         "missing_inputs": missing_inputs,
         "assumptions": list(result.assumptions),
-        "observed_inputs": dict(inputs),
+        "inputs": {
+            "median_price_4room": median_price,
+            "down_payment": round(down_payment, 2),
+            "loan_principal": round(principal, 2),
+            "ltv": ltv,
+            "annual_rate": rate,
+            "years": years,
+            "repayment_cap": cap,
+        },
         "factors": [
             {
                 "name": f.name,
-                "magnitude": round(f.magnitude, 4),
+                "magnitude": round(f.magnitude, 2),
                 "share_of_total": round(f.share_of_total, 4),
                 "source_field": f.source_field,
                 "explanation": f.explanation,
             }
             for f in result.factors
         ],
+        # The comparison to reality — 2021-vintage income, see the caveat
+        # for the direction of the resulting bias.
+        "actual_monthly_household_income": actual_monthly_income,
+        "actual_household_income_vintage": "CBS 2021 socioeconomic survey" if actual_monthly_income is not None else None,
+        "income_gap_monthly": round(income_gap_monthly, 2) if income_gap_monthly is not None else None,
+        "years_of_income_to_buy_at_actual_income": (
+            round(years_of_income, 2) if years_of_income is not None else None
+        ),
     }
 
 
 def rank_by_priorities(
     item_ids: list[str], emphasize: list[str] | None = None, deemphasize: list[str] | None = None
 ) -> dict[str, Any]:
-    """Rank items with the weights adjusted to the user's stated
-    priorities ("I care about being fast and cheap").
+    """Rank localities with the weights adjusted to the user's stated
+    priorities ("I care about a short commute and don't mind paying
+    more").
 
     Returns BOTH the default ranking and the adjusted one, deliberately.
     Handing back only the adjusted list would let a reweighting change
@@ -1356,6 +1505,11 @@ def rank_by_priorities(
     honored, not for the default result to be quietly replaced. Showing
     both makes the effect of their own stated preference legible, and
     makes it obvious when the preference changed nothing.
+
+    Same eligibility gate every other ranking tool applies (see
+    `_gate_ids`), applied here directly rather than inherited — this is
+    exactly the sibling tool whose missing gate was the prior build's
+    real, observed bug.
     """
     emphasize = emphasize or []
     deemphasize = deemphasize or []
@@ -1373,6 +1527,7 @@ def rank_by_priorities(
             {
                 "rank": r.rank,
                 "item_id": r.item_id,
+                "name_en": dataset.LOCALITIES.get(r.item_id, {}).get("name_en"),
                 "total_score": round(r.total_score, 4),
                 "components": [
                     {
@@ -1395,10 +1550,9 @@ def rank_by_priorities(
 
     # Tie detection, for the same reason compare_items has it: two scores
     # inside DECISIVE_SCORE_GAP are the same score. Without this the tool
-    # reported "your priorities changed the winner" off a 0.0020 gap —
-    # announcing an effect on a difference this file elsewhere calls
-    # noise. A reweighting only changed the winner if the new leader was
-    # outside the old leader's tie band.
+    # could report "your priorities changed the winner" off a gap this
+    # file elsewhere calls noise. A reweighting only changed the winner if
+    # the new leader was outside the old leader's tie band.
     default_tied = _tie_group(default_rows)
     adjusted_tied = _tie_group(adjusted_rows)
     changed_the_winner = bool(
@@ -1415,7 +1569,7 @@ def rank_by_priorities(
         "default_ranking": default_rows,
         "adjusted_ranking": adjusted_rows,
         # Same eligibility gate every other ranking tool applies, and
-        # returned for the same reason — the user asked about these.
+        # returned for the same reason — the user asked about these ids.
         "ineligible": ineligible,
         "default_tied_at_top": default_tied,
         "adjusted_tied_at_top": adjusted_tied,
@@ -1433,13 +1587,20 @@ def rank_by_priorities(
 def analyze_weight_sensitivity(item_ids: list[str], criterion: str, factor: float) -> dict[str, Any]:
     """Re-rank with one criterion's weight scaled by `factor`, and report
     what actually moved. Answers "what happens if this weight is wrong?"
-    with evidence instead of reassurance."""
+    with evidence instead of reassurance.
+
+    Same eligibility gate every other ranking tool applies (see
+    `_gate_ids`) — without it, this report would compute flip factors
+    over a population compare_items would never actually rank, so the
+    "confidence" evidence would describe a ranking the user was never
+    shown.
+    """
     # A negative factor produces a NEGATIVE weight, which silently breaks
-    # two invariants scoring.py annotates as guaranteed: total_score in
-    # 0..1, and component weights summing to 1. factor=-5 yields
-    # total_score=-2.68 with covered_weight=1.0 — a payload that reads as
-    # fully valid. apply_priority_emphasis already guards this; the guard
-    # simply was never applied to the other entry point.
+    # two invariants scoring.py guarantees: total_score in 0..1, and
+    # component weights summing to 1. apply_priority_emphasis already
+    # guards this (factor must be > 0); the guard is repeated here
+    # because this is a different entry point into the same underlying
+    # risk — scale_criterion_weight has no floor of its own.
     if factor <= 0:
         raise ValueError(
             f"factor must be greater than 0 (got {factor}). A zero or negative weight "
@@ -1464,8 +1625,8 @@ def analyze_weight_sensitivity(item_ids: list[str], criterion: str, factor: floa
             "changed": result.top_changed,
         },
         # Kendall tau: +1 means the order is untouched, lower means churn.
-        # One number for "did this weight actually matter", which is more
-        # honest than eyeballing two lists that look similar.
+        # One number for "did this weight actually matter", more honest
+        # than eyeballing two lists that look similar.
         "kendall_tau": round(result.kendall_tau, 4),
         "items_moved": result.items_moved,
         "max_rank_movement": result.max_rank_movement,
@@ -1476,6 +1637,7 @@ def analyze_weight_sensitivity(item_ids: list[str], criterion: str, factor: floa
         "changes": [
             {
                 "item_id": c.item_id,
+                "name_en": dataset.LOCALITIES.get(c.item_id, {}).get("name_en"),
                 "rank_before": c.baseline_rank,
                 "rank_after": c.perturbed_rank,
                 "rank_delta": c.rank_delta,
@@ -1494,7 +1656,8 @@ def weight_robustness_report(item_ids: list[str]) -> dict[str, Any]:
     load-bearing and its exact weight barely matters.
 
     This is the tool for "how confident are you in this ranking?" — and
-    it can legitimately return "not very", which is the point.
+    it can legitimately return "not very", which is the point. Same
+    eligibility gate every other ranking tool applies (see `_gate_ids`).
     """
     item_ids, ineligible = _gate_ids(item_ids)
     items = {item_id: fetch_item_metrics(item_id) for item_id in item_ids}
@@ -1512,7 +1675,7 @@ def weight_robustness_report(item_ids: list[str]) -> dict[str, Any]:
                     "No weight multiplier up to 10x changes the winner — this criterion's "
                     "exact weight is not load-bearing."
                     if flip is None
-                    else f"Scaling this weight by {flip}x changes the top-ranked item. "
+                    else f"Scaling this weight by {flip}x changes the top-ranked locality. "
                     + (
                         "That is a small change, so the ranking is SENSITIVE to this weight "
                         "and the top result should be presented as close, not decisive."
@@ -1537,7 +1700,12 @@ def weight_robustness_report(item_ids: list[str]) -> dict[str, Any]:
         # user was never shown.
         "ineligible": ineligible,
         "baseline_ranking": [
-            {"rank": r.rank, "item_id": r.item_id, "total_score": round(r.total_score, 4)}
+            {
+                "rank": r.rank,
+                "item_id": r.item_id,
+                "name_en": dataset.LOCALITIES.get(r.item_id, {}).get("name_en"),
+                "total_score": round(r.total_score, 4),
+            }
             for r in baseline.ranked
         ],
         "criteria": findings,
@@ -1552,171 +1720,145 @@ def weight_robustness_report(item_ids: list[str]) -> dict[str, Any]:
 
 
 # ── The one genuinely live call ──────────────────────────────────────────
-# FAA NAS Status: free, no key, no signup, real-time. It satisfies the
-# brief's "use public APIs" requirement with an actual live request
-# rather than a static file that was fetched once.
+# The Bank of Israel publishes its own known/monetary interest rate
+# (הריבית הידועה) keylessly, in real time, at the URL below — verified by
+# hand (curl, and a plain urllib.request.urlopen with no spoofed headers)
+# on 2026-08-20/21; it returns clean JSON with no CAPTCHA or bot wall.
 #
 # DELIBERATELY OUTSIDE THE SCORED PATH, and that is the interesting
-# decision. A ground stop at SNA this afternoon says exactly nothing
-# about whether SNA is worth a terminal investment over the next decade —
-# it is weather, or a runway closure, or an equipment outage. Feeding
-# transient operational status into a capital-planning score would be
-# indefensible in about ten seconds of questioning. So it is presented as
-# live operational colour alongside the ranking, never as an input to it.
+# decision, same shape as the prior (airport) build's FAA NAS Status
+# call. A mortgage-rate move changes what EVERY buyer can afford,
+# everywhere, on the same day — it says nothing about whether one
+# LOCALITY is better value than another, so feeding it into the ranking
+# would conflate a national macro fact with a place-specific one. See
+# system_prompt.py rule 7.
 #
-# Note it returns XML, not JSON, which is why this parses rather than
-# json.loads. Kept in the standard library — adding a dependency to read
-# one small document is not worth it.
-NAS_STATUS_URL = "https://nasstatus.faa.gov/api/airport-status-information"
-NAS_STATUS_TIMEOUT_SECONDS = 6.0
+# This is NOT itself a mortgage rate: it is the central bank's own policy
+# rate, which most Israeli banks then use as the base for a Prime-tracked
+# lending tranche (מסלול פריים) by adding a standard spread. Both numbers
+# are returned, clearly labelled, rather than presenting the base rate as
+# if it were what a borrower would actually be quoted.
+BOI_INTEREST_RATE_URL = "https://boi.org.il/PublicApi/GetInterest"
+BOI_TIMEOUT_SECONDS = 6.0
+
+# Standard spread Israeli banks price into a Prime-tracked mortgage
+# tranche on top of the Bank of Israel's own known rate — a widely cited
+# market convention (not a regulatory figure the way LTV is, so treated,
+# like affordability.py's DEFAULT_REPAYMENT_CAP, as a documented,
+# overridable assumption rather than an authoritative constant).
+PRIME_MORTGAGE_SPREAD = 0.015  # 1.5 percentage points
+
+# Used ONLY when the live feed is unreachable — see the except branch
+# below. Bank of Israel known rate as last observed by this project
+# (2026-08-21: 3.50%), plus PRIME_MORTGAGE_SPREAD. Matches
+# ASSUMED_MORTGAGE_ANNUAL_RATE exactly on purpose: it is the same
+# real-world number, stated once as a constant here and reused there
+# rather than risking the two drifting apart.
+FALLBACK_BOI_KNOWN_RATE = 0.035  # 3.50%, observed 2026-08-21
+FALLBACK_ASSUMED_PRIME_MORTGAGE_RATE = FALLBACK_BOI_KNOWN_RATE + PRIME_MORTGAGE_SPREAD
+FALLBACK_STATED_DATE = "2026-08-21"
 
 
-def get_live_airport_status(item_id: str) -> dict[str, Any]:
-    """Current FAA operational status: ground stops, ground delay
-    programs, closures, arrival/departure delays.
+def get_current_mortgage_rates() -> dict[str, Any]:
+    """Live Bank of Israel known rate, plus an estimated Prime-track
+    mortgage rate built from it.
 
-    Every failure mode here returns `{"available": false, "reason": ...}`
-    rather than raising, because this tool is decoration on an answer that
-    must still work without it. A timeout on a live feed should degrade
-    the response, not fail the question — the agent loop would otherwise
-    surface a tool error for something genuinely optional.
+    Every failure mode here returns a payload with `available: False`
+    and a clearly-labelled STATED ASSUMPTION default, rather than
+    raising or silently substituting a scrape of some other source —
+    per the standing rule that a blocked data source gets reported, not
+    worked around (see _working/PROGRESS.md). The failure is visible IN
+    the payload itself (`available`, `is_stated_assumption`, `reason`),
+    not just in a log line the model never sees, because this tool is
+    decoration on an answer that must still work without it — a timeout
+    on a live feed should degrade the response, not fail the question.
     """
-    if item_id not in dataset.AIRPORTS:
-        raise _unknown_airport(item_id)
-
     try:
-        with urllib.request.urlopen(NAS_STATUS_URL, timeout=NAS_STATUS_TIMEOUT_SECONDS) as resp:
-            root = ElementTree.fromstring(resp.read())
-    except (urllib.error.URLError, ElementTree.ParseError, OSError) as exc:
+        request = urllib.request.Request(
+            BOI_INTEREST_RATE_URL, headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(request, timeout=BOI_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+        # The API returns e.g. 3.5 meaning 3.5%, not a 0..1 fraction —
+        # verified by hand against the published rate (3.50% as of the
+        # last Monetary Committee decision before 2026-08-21).
+        boi_known_rate = float(payload["currentInterest"]) / 100.0
+        estimated_prime_rate = boi_known_rate + PRIME_MORTGAGE_SPREAD
         return {
-            "item_id": item_id,
-            "available": False,
-            "reason": f"FAA NAS Status unreachable ({type(exc).__name__}). "
-                      "Report the ranking without live status rather than guessing it.",
-            "source": NAS_STATUS_URL,
+            "available": True,
+            "is_stated_assumption": False,
+            "source": BOI_INTEREST_RATE_URL,
+            "boi_known_rate": boi_known_rate,
+            "boi_known_rate_pct": f"{boi_known_rate:.2%}",
+            "prime_mortgage_spread": PRIME_MORTGAGE_SPREAD,
+            "estimated_prime_mortgage_rate": estimated_prime_rate,
+            "estimated_prime_mortgage_rate_pct": f"{estimated_prime_rate:.2%}",
+            "last_published_date": payload.get("lastPublishedDate"),
+            "next_interest_decision_date": payload.get("nextInterestDate"),
+            "note": (
+                "boi_known_rate is the Bank of Israel's own known/monetary interest rate "
+                "(הריבית הידועה), fetched live just now. estimated_prime_mortgage_rate adds "
+                f"the standard {PRIME_MORTGAGE_SPREAD:.1%} spread Israeli banks price into a "
+                "Prime-tracked mortgage tranche (מסלול פריים) — a citable convention, not "
+                "this specific borrower's actual quote, which depends on the bank and the "
+                "borrower's own profile. This is NOT part of the value-for-money score and "
+                "must never be used as evidence for or against a locality."
+            ),
         }
-
-    # ElementTree has no parent pointers, so build the map once. It is
-    # needed because the CATEGORY of an event lives on an ancestor
-    # (<Delay_type><Name>Airport Closures</Name>), not on the node
-    # carrying the airport code.
-    parents = {child: parent for parent in root.iter() for child in parent}
-
-    def category_of(node: ElementTree.Element) -> str:
-        """Nearest labelled ancestor — the FAA's own name for this kind of
-        event."""
-        current = parents.get(node)
-        while current is not None:
-            name = (current.findtext("Name") or "").strip()
-            if name:
-                return name
-            current = parents.get(current)
-        return "Unclassified"
-
-    events: list[dict[str, Any]] = []
-    # The previous version flattened the tree with root.iter() and reported
-    # node.tag as the type, so every event came back as "Delay" or
-    # "Airport" and the feed's own labels were unreachable. It also kept
-    # only <Reason>, discarding <Min>/<Max>/<Trend> on delays and
-    # <Start>/<Reopen> on closures.
-    #
-    # That combination produced confidently wrong statements. A real
-    # example: LAX carries a standing NOTAM reading "LAX AD AP CLSD TO NON
-    # SKED TRANSIENT GA ACFT EXC 24HR PPR", valid for a year. Stripped of
-    # its category and its dates it reads as "LAX AD AP CLSD", and the
-    # agent reported LAX as closed. It is open; it is restricted to
-    # scheduled traffic without prior permission. Meanwhile JFK, with a
-    # genuine 16-30 minute increasing departure delay, returned the least
-    # informative payload of the three, because all of its numbers were in
-    # exactly the sibling elements being dropped.
-    for node in root.iter():
-        code = ""
-        for tag in ("ARPT", "IATA", "Airport"):
-            child = node.find(tag)
-            if child is not None and child.text and child.text.strip():
-                code = child.text.strip()
-                break
-        if code != item_id:
-            continue
-        # Keep the whole matched subtree. Which fields are present depends
-        # on the event kind, and guessing wrong is how the delay
-        # magnitudes were lost the first time.
-        detail: dict[str, Any] = {}
-        for child in node.iter():
-            if child is node:
-                continue
-            has_text = bool((child.text or "").strip())
-            if not has_text and not child.attrib:
-                # A pure grouping element (no text of its own, no
-                # attributes) — e.g. the wrapper around Min/Max/Trend.
-                # Its children are still walked, since node.iter() does
-                # not stop at it; there is just nothing to record here.
-                continue
-            key = child.tag
-            if child.attrib:
-                # <Arrival_Departure Type="Departure"> carries no text of
-                # its own — its meaning is entirely in the attribute — and
-                # is exactly the case a text-only check drops silently.
-                # It's the qualifier that says whether "16 minutes" is
-                # arrivals or departures, which is most of the meaning.
-                key = f"{key}[{','.join(child.attrib.values())}]"
-            detail[key] = child.text.strip() if has_text else True
-        events.append({"category": category_of(node), "element": node.tag, "detail": detail})
-
-    return {
-        "item_id": item_id,
-        "available": True,
-        "has_active_events": bool(events),
-        "events": events,
-        "source": NAS_STATUS_URL,
-        # Stated in the payload, not just in a comment, because the model
-        # is what has to relay it to the user.
-        "scope_note": (
-            "Live operational status only. This is NOT part of the investment score and must "
-            "not be described as if it were — a ground delay today is weather or an equipment "
-            "outage, not evidence about whether this airport is worth expanding."
-        ),
-        # The feed mixes live delay programs with standing NOTAMs that can
-        # run for a year, and a NOTAM's text often begins with something
-        # that reads like "AP CLSD". Report what the fields say, including
-        # the dates, rather than summarizing an event as a closure.
-        "reading_note": (
-            "Each event carries its FAA category and its own fields. Do not paraphrase an "
-            "event as 'the airport is closed' unless a field says so: many entries are "
-            "standing NOTAMs restricting a class of traffic, with validity dates in the "
-            "text, not closures happening now. Quote the category and the relevant fields."
-        ),
-    }
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, OSError) as exc:
+        return {
+            "available": False,
+            "is_stated_assumption": True,
+            "source": BOI_INTEREST_RATE_URL,
+            "reason": (
+                f"Bank of Israel public rate API unreachable or returned an unexpected shape "
+                f"({type(exc).__name__}: {exc})."
+            ),
+            "boi_known_rate": FALLBACK_BOI_KNOWN_RATE,
+            "boi_known_rate_pct": f"{FALLBACK_BOI_KNOWN_RATE:.2%}",
+            "prime_mortgage_spread": PRIME_MORTGAGE_SPREAD,
+            "estimated_prime_mortgage_rate": FALLBACK_ASSUMED_PRIME_MORTGAGE_RATE,
+            "estimated_prime_mortgage_rate_pct": f"{FALLBACK_ASSUMED_PRIME_MORTGAGE_RATE:.2%}",
+            "stated_assumption_source": (
+                f"Bank of Israel known rate as last observed by this project ({FALLBACK_STATED_DATE}: "
+                f"{FALLBACK_BOI_KNOWN_RATE:.2%}) plus the standard {PRIME_MORTGAGE_SPREAD:.1%} "
+                "Prime-track spread."
+            ),
+            "stated_assumption_date": FALLBACK_STATED_DATE,
+            "note": (
+                "The live Bank of Israel rate feed was unreachable just now, so this is a "
+                "STATED, DATED ASSUMPTION, not a live measurement — say so if you relay it. "
+                "Never present it as current."
+            ),
+        }
 
 
 # Dispatch table used by agent_loop.py: tool name -> callable(args_dict).
 # Kept as a plain dict, not a decorator/registry framework — this is the
 # entire "tool registry" a hand-rolled loop needs.
 def _find_items_filters(args: dict[str, Any]) -> dict[str, str]:
-    """Normalize find_items' arguments. Three shapes arrive in practice and
-    they do NOT mean the same thing:
+    """Normalize find_items' arguments. Three shapes arrive in practice
+    and they do NOT mean the same thing — carried over verbatim from the
+    prior build, which found this live on its own first eval question:
 
         {}                       -> match everything. Legitimate and
-                                    documented; a model asking for the whole
-                                    dataset. args.get (not args[...]) because
-                                    a raw KeyError('filters') here was logged
-                                    as a tool error in P4 evals instead of the
+                                    documented; a model asking for the
+                                    whole dataset. args.get (not
+                                    args[...]) because a raw
+                                    KeyError('filters') here would read
+                                    as a tool error instead of the
                                     empty-filter result clearly intended.
         {"filters": {...}}       -> the schema's shape.
-        {"new_england": "yes"}   -> the model dropped the wrapper.
+        {"district": "North"}    -> the model dropped the wrapper.
 
-    The third used to collapse into the first: args.get("filters") returned
-    None, "no filters" means "match everything", and a request for a SUBSET
-    silently returned all 515 rows. The model then listed New England
-    airports from its own memory — the exact hallucination find_items exists
-    to prevent — wearing a successful tool call as cover. Found live on the
-    brief's own first question.
-
-    So a flattened call is read as filters rather than as "no filters".
-    Nothing is guessed: an unrecognized key still lands in
-    `unknown_filter_keys` downstream, which already tells the model it
-    filtered on a field that does not exist. Only scalars are taken; a
-    stray list or object is another tool's argument, not a filter value.
+    The third used to collapse into the first: args.get("filters")
+    returned None, "no filters" means "match everything", and a request
+    for a SUBSET silently returned every locality. So a flattened call is
+    read as filters rather than as "no filters". Nothing is guessed: an
+    unrecognized key still lands in `unknown_filter_keys` downstream,
+    which already tells the model it filtered on a field that does not
+    exist. Only scalars are taken; a stray list or object is another
+    tool's argument, not a filter value.
     """
     if "filters" in args:
         return args.get("filters") or {}
@@ -1724,7 +1866,6 @@ def _find_items_filters(args: dict[str, Any]) -> dict[str, str]:
 
 
 TOOL_REGISTRY: dict[str, Callable[[dict[str, Any]], Any]] = {
-    "get_live_airport_status": lambda args: get_live_airport_status(item_id=args["item_id"]),
     "compare_items": lambda args: compare_items(
         item_ids=args["item_ids"], focus_criterion=args.get("focus_criterion")
     ),
@@ -1745,4 +1886,5 @@ TOOL_REGISTRY: dict[str, Callable[[dict[str, Any]], Any]] = {
         emphasize=args.get("emphasize"),
         deemphasize=args.get("deemphasize"),
     ),
+    "get_current_mortgage_rates": lambda _: get_current_mortgage_rates(),
 }
