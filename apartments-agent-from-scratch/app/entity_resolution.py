@@ -567,17 +567,43 @@ def resolve(query: str, catalog: Mapping[str, Sequence[str]], top_k: int = 5) ->
         # differences at all. _exact_key is a no-op for Latin text (same
         # casefold comparison as before Hebrew support existed).
         query_key = _exact_key(stripped)
-        exact = [
-            EntityCandidate(
-                item_id=item_id,
-                matched_text=text,
-                confidence=1.0,
-                signals=(("exact_short_query_match", 1.0),),
-            )
-            for item_id, texts in catalog.items()
-            for text in texts
-            if _exact_key(text) == query_key
-        ]
+        # ONE candidate per ITEM, not one per matching alias.
+        #
+        # An item legitimately carries several names that can collapse to
+        # the same exact key: name_en, name_he, and the curated
+        # transliteration variants all live in the catalog, and for a short
+        # name several of them are the same string once _exact_key has
+        # folded case, niqqud and final letters. Emitting one candidate per
+        # matching alias made an item compete with ITSELF.
+        #
+        # That was not cosmetic. `decisive` below is a statement about how
+        # many distinct PLACES the query could mean, so counting aliases
+        # made a perfectly unambiguous query look ambiguous: "Lod" matched
+        # locality 7000 twice at confidence 1.0 each, len(candidates) == 2,
+        # decisive=False — and the agent, obeying NEVER_INVENT_IDS_RULE,
+        # would then stop and ask the user to disambiguate Lod from Lod.
+        # A real user-facing failure, found by scripts/calibrate_resolver.py
+        # as a false negative on a 3-character name.
+        #
+        # First alias wins as the representative text. They are equal under
+        # _exact_key by construction, so the choice only affects which
+        # spelling is echoed back, and catalog order puts the display name
+        # first.
+        seen_items: set[str] = set()
+        exact: list[EntityCandidate] = []
+        for item_id, texts in catalog.items():
+            for text in texts:
+                if _exact_key(text) != query_key or item_id in seen_items:
+                    continue
+                seen_items.add(item_id)
+                exact.append(
+                    EntityCandidate(
+                        item_id=item_id,
+                        matched_text=text,
+                        confidence=1.0,
+                        signals=(("exact_short_query_match", 1.0),),
+                    )
+                )
         if exact:
             exact.sort(key=lambda c: c.item_id)
             top_exact = tuple(exact[:top_k])

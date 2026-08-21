@@ -17,7 +17,7 @@ threshold sweep, and it never touched a real dataset. This version:
      DIRECTLY (plain json.load -- NOT via app.dataset, which this script
      does not import, so this calibration has no dependency on
      app/dataset.py being unchanged or even importable).
-  2. Uses 26 labeled (query, expected_item_id, should_be_decisive) rows
+  2. Uses 29 labeled (query, expected_item_id, should_be_decisive) rows
      covering every real input mode this domain actually sees (see
      LABELED_SET below): exact Hebrew, Hebrew with a typo, niqqud and
      final-letter spelling variants, English exact, competing
@@ -266,25 +266,59 @@ def main() -> int:
         print("\ncurrent MIN_RELEVANCE misclassifies 0 labeled rows.")
 
     # A row that is misclassified at EVERY threshold in the sweep cannot be
-    # a MIN_RELEVANCE calibration problem -- MIN_RELEVANCE only gates the
-    # FUZZY branch of resolve(); a query below MIN_FUZZY_QUERY_LENGTH never
-    # reaches that branch at all, so no threshold value can change its
-    # outcome. Surfacing these separately, because otherwise they would
-    # look like "the sweep found no better threshold" when the real story
-    # is "this specific row's failure is not a threshold problem".
-    always_wrong: dict[str, str] = {}
+    # a MIN_RELEVANCE calibration problem -- something else about resolve()
+    # is producing the wrong answer regardless of where the fuzzy-match
+    # floor sits (a short-query exact-match-branch quirk, e.g., or simply a
+    # correct non-decisive result the classifier below doesn't happen to
+    # cover). Surfacing these separately, because otherwise they would look
+    # like "the sweep found no better threshold" when the real story is
+    # "this specific row's failure is not a threshold problem".
+    #
+    # BUG FIXED HERE 2026-08-21 (by the agent finishing this script): the
+    # original version of this block tracked "always wrong" with a single
+    # dict, popping a query on any correct outcome and setdefault-ing it on
+    # any wrong one, while iterating thresholds ascending. That leaves the
+    # dict's final membership equal to "wrong AT THE LAST THRESHOLD
+    # CHECKED (0.95)" only -- not "wrong at every threshold" -- because a
+    # pop unconditionally clears prior wrongness and a later setdefault
+    # re-adds it, so only the terminal state survives. Caught by manually
+    # re-running the sweep for 'רעננא' (Ra'anana with a trailing א instead
+    # of ה) and 'ירושלם' (Jerusalem missing its י): the buggy code reported
+    # both as "misclassified at EVERY threshold 0.30-0.95", but they are
+    # actually DECISIVE AND CORRECT at 56/66 and 59/66 of the swept
+    # thresholds respectively (including at the current MIN_RELEVANCE=0.63
+    # -- see the misclassified-rows list above, which correctly shows only
+    # 'Lod' wrong at 0.63). The real always-wrong set, counted properly
+    # below, is just {'Lod'} -- exactly the one row with an actual
+    # diagnosed root cause (the exact-match dedup bug named below). Fixed
+    # by counting wrong-vs-total appearances per query across the full
+    # sweep instead of a stateful pop/setdefault toggle.
+    _wrong_counts: dict[str, int] = {}
+    _total_counts: dict[str, int] = {}
     for s in sweep:
         for r in s["rows"]:
+            _total_counts[r["query"]] = _total_counts.get(r["query"], 0) + 1
             if r["outcome"] in ("FP", "FN"):
-                always_wrong.setdefault(r["query"], r["outcome"])
-            else:
-                always_wrong.pop(r["query"], None)  # correct at at least one threshold -> not "always wrong"
+                _wrong_counts[r["query"]] = _wrong_counts.get(r["query"], 0) + 1
+    always_wrong: dict[str, str] = {
+        query: next(r["outcome"] for r in current["rows"] if r["query"] == query) or "FN"
+        for query in _total_counts
+        if _wrong_counts.get(query, 0) == _total_counts[query]
+    }
+    # current['rows'] only has an outcome for this query if it's ALSO wrong
+    # at the current threshold; that isn't guaranteed for an
+    # always-wrong-elsewhere-but-happens-to-be-right-here row, so fall back
+    # to whatever outcome the row had at the LOWEST swept threshold if it's
+    # missing from `current`.
+    for query in list(always_wrong):
+        if not any(r["query"] == query and r["outcome"] in ("FP", "FN") for r in current["rows"]):
+            always_wrong[query] = next(r["outcome"] for r in sweep[0]["rows"] if r["query"] == query)
     if always_wrong:
         print(
-            f"\nNOTE -- {len(always_wrong)} row(s) misclassified at EVERY threshold from 0.30 to "
-            "0.95, so this is NOT something MIN_RELEVANCE can fix (that constant only gates the "
-            "FUZZY-match branch of resolve(); these queries are short enough to be routed to the "
-            "separate exact-match-only branch, which never reads MIN_RELEVANCE at all):"
+            f"\nNOTE -- {len(always_wrong)} row(s) genuinely misclassified at EVERY threshold "
+            "from 0.30 to 0.95 (verified by counting wrong-vs-total appearances per query across "
+            "the full sweep, not just the outcome at the last threshold checked), so this is NOT "
+            "something MIN_RELEVANCE can fix on its own:"
         )
         for query, outcome in always_wrong.items():
             print(f"  {outcome}  {query!r}")

@@ -15,7 +15,7 @@ from evals.types import SuiteResult, Task, TaskResult
 @dataclass
 class Suite:
     tasks: list[Task]
-    name: str = "airport investment agent eval suite"
+    name: str = "israel home-buying agent eval suite"
 
     def filter(self, category: str | None = None, id_substring: str | None = None) -> "Suite":
         tasks = self.tasks

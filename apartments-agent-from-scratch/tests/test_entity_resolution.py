@@ -477,3 +477,57 @@ def test_resolve_short_non_code_shaped_hebrew_query_returns_nothing():
     result = resolve("בן", CATALOG)
     assert result.candidates == ()
     assert result.decisive is False
+
+
+# ── Regression: alias-count vs. place-count in the short-query path ──────
+
+# A catalog entry whose aliases COLLAPSE to the same exact key once case,
+# niqqud and final letters are folded. This is not contrived: the real
+# ENTITY_CATALOG carries name_en, name_he and curated transliteration
+# variants per locality, and for a short name several of those are the
+# same string under _exact_key. "לד" and "Lod" stand in for that here.
+_DUPLICATE_ALIAS_CATALOG = {
+    "7000": ["Lod", "lod", "LOD", "לוד"],
+    "8600": ["Ramat Gan", "רמת גן"],
+}
+
+# Two genuinely different towns that people both call "Modiin". Kept
+# separate from the catalog above so the two tests cannot mask each other.
+_AMBIGUOUS_CATALOG = {
+    "1200": ["Modiin", "מודיעין-מכבים-רעות"],
+    "3797": ["Modiin", "מודיעין עילית"],
+}
+
+
+def test_short_exact_query_returns_one_candidate_per_place_not_per_alias():
+    """A short name whose aliases fold to the same key must not make a
+    place compete with itself.
+
+    `Lod` is three characters, so it takes resolve()'s short-query
+    exact-match path. The first implementation emitted one candidate per
+    matching ALIAS rather than per item, so locality 7000 appeared four
+    times at confidence 1.0 each; `decisive` — which is a claim about how
+    many distinct PLACES the query could mean — came back False, and the
+    agent, obeying NEVER_INVENT_IDS_RULE, would stop and ask the user to
+    disambiguate Lod from Lod.
+
+    Found by scripts/calibrate_resolver.py as a false negative on a
+    3-character name, which is exactly what that script exists to catch.
+    """
+    for query in ("Lod", "lod", "LOD", "לוד"):
+        result = resolve(query, _DUPLICATE_ALIAS_CATALOG)
+        ids = [c.item_id for c in result.candidates]
+        assert ids == ["7000"], f"{query!r} resolved to {ids}, expected exactly ['7000']"
+        assert result.decisive is True, f"{query!r} names exactly one place; it should be decisive"
+
+
+def test_genuinely_ambiguous_short_query_stays_non_decisive():
+    """The counterpart, and the reason the fix dedupes by item_id rather
+    than by matched text: collapsing duplicates must not flatten a REAL
+    ambiguity into false confidence. Two distinct ids must survive, and
+    the result must stay non-decisive so the agent asks instead of guessing.
+    """
+    result = resolve("Modiin", _AMBIGUOUS_CATALOG)
+    ids = {c.item_id for c in result.candidates}
+    assert ids == {"1200", "3797"}, f"expected both towns, got {ids}"
+    assert result.decisive is False

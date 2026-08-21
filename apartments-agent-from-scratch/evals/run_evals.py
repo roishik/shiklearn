@@ -89,7 +89,7 @@ def main() -> None:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     md_path = out_dir / f"{provider.name}_{ts}.md"
     json_path = out_dir / f"{provider.name}_{ts}.json"
-    md_path.write_text(render_markdown(result, title=f"airport-agent eval suite — provider={provider.name}"))
+    md_path.write_text(render_markdown(result, title=f"israel-home-buying-agent eval suite — provider={provider.name}"))
     json_path.write_text(render_json(result))
 
     print()

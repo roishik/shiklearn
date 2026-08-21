@@ -75,7 +75,7 @@ class Task:
                         TOOL_SCHEMAS for this task only — lets a task
                         exercise a tool that doesn't exist in the base
                         app (e.g. the injection-bearing
-                        get_airport_advisory_note fixture) without mutating the
+                        get_planning_note fixture) without mutating the
                         shared app.tools module
     expected_tool       see module docstring "grade outcomes, not paths"
     forbidden_tools      ditto
