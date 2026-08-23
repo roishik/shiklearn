@@ -85,14 +85,28 @@ def _provider_summary() -> str:
     for it — never the key's VALUE. Printed unconditionally so a reader
     of the console output (or the saved transcript) can tell at a glance
     whether this was a mock run or a real one."""
+    # `mock` is deliberately NOT reported as "key configured: True". It
+    # needs no key by construction, so the old phrasing was technically
+    # true and practically backwards: it printed the reassuring line
+    # exactly on the run where no real model is involved at all, which is
+    # the one case this function exists to make unmistakable.
+    if LLM_PROVIDER == "mock":
+        return (
+            f"LLM_PROVIDER={LLM_PROVIDER!r} — NO REAL MODEL. "
+            "Scripted stub, no key needed and none used."
+        )
     key_status = {
         "openai": have_openai_key(),
         "anthropic": have_anthropic_key(),
         "groq": have_groq_key(),
-        "mock": True,  # mock needs no key by construction
     }
     have_key = key_status.get(LLM_PROVIDER, False)
-    return f"LLM_PROVIDER={LLM_PROVIDER!r} (key configured: {have_key})"
+    if not have_key:
+        return (
+            f"LLM_PROVIDER={LLM_PROVIDER!r} but NO KEY IS CONFIGURED for it — "
+            "calls will fail. Set it in .env, or use LLM_PROVIDER=mock."
+        )
+    return f"LLM_PROVIDER={LLM_PROVIDER!r}, real key configured — this is a live run."
 
 
 def _run_one(qid: str, question: str, provider) -> dict:
