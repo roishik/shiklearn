@@ -81,8 +81,18 @@
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
           "Segoe UI Variable Text", "Segoe UI", "Arial Hebrew", "Noto Sans Hebrew",
           Inter, system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  /* Hebrew fallbacks appended for the same reason --sans has them above:
+     the tool-call log and the example questions both carry real Hebrew
+     text (place names, and the shekel sign) inside this monospace
+     viewport, and code-oriented monospace fonts are frequently missing
+     from currency symbols even when they cover Hebrew LETTERS -- ש"ח's
+     sign, U+20AA (Hebrew Shekel Sign), rendered as a tofu box in testing
+     under every font ahead of it in this stack. Ordered last, after
+     every real monospace face, so normal code/JSON keeps its fixed-width
+     alignment; these only get used per-GLYPH, for characters none of the
+     monospace fonts above actually have. */
   --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas,
-          "Noto Sans Mono", "Liberation Mono", monospace;
+          "Noto Sans Mono", "Liberation Mono", "Arial Hebrew", "Noto Sans Hebrew", monospace;
 
   --r-lg: 16px;
   --r-md: 12px;
