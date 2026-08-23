@@ -135,7 +135,7 @@ reproduced the exact bug it had been written to prevent.
 
 ## 3. How much do the weights actually matter? — the fragility finding
 
-Full report: [`evals/results/sensitivity_20260821T044313Z.md`](evals/results/sensitivity_20260821T044313Z.md),
+Full report: [`evals/results/sensitivity_20260823T102830Z.md`](evals/results/sensitivity_20260823T102830Z.md),
 regenerate with `scripts/sensitivity_report.py`.
 
 **The famous expensive cities lose, decisively.** Tel Aviv-Yafo ranks **63rd of

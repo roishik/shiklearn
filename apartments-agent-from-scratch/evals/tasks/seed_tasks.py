@@ -65,7 +65,6 @@ from __future__ import annotations
 from typing import Any
 
 from app.tools import (
-    TOOL_REGISTRY,
     aggregate_records,
     compare_items,
     estimate_derived_metric,

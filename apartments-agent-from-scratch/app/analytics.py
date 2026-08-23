@@ -51,7 +51,7 @@ class UnsupportedOperationError(ValueError):
 # ─────────────────────────────────────────────────────────────────────────
 def filter_items(
     attributes: Mapping[str, Mapping[str, str]],
-    filters: Mapping[str, str],
+    filters: Mapping[str, str | int | float | bool],
 ) -> tuple[str, ...]:
     """Return the ids whose attributes match EVERY filter (AND semantics),
     sorted for determinism.

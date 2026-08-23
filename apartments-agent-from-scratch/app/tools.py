@@ -273,7 +273,14 @@ def _neighborhood_not_rankable(item_id: str) -> UnknownItemError:
     LOCALITY. See _gate_ids' docstring for why this is a distinct error
     from 'unknown id' — a neighborhood is a real, known thing, just not
     the kind of thing this tool ranks."""
+    # Every row in dataset.NEIGHBORHOODS carries parent_id by construction
+    # of data/processed_data/neighborhoods.json (verified: 0 of 1,394 rows
+    # missing it). Asserting rather than silently formatting a "parent
+    # locality is None" message into a user-facing error keeps that
+    # invariant honest instead of letting a data-pipeline regression show
+    # up as a confusing string three calls away from its actual cause.
     parent_id = dataset.NEIGHBORHOODS[item_id].get("parent_id")
+    assert parent_id is not None, f"data invariant violated: neighborhood {item_id!r} has no parent_id"
     parent_name = dataset.LOCALITIES.get(parent_id, {}).get("name_en", parent_id)
     return UnknownItemError(
         f"{item_id!r} is a NEIGHBORHOOD, not a locality — nadlan.gov.il and CBS both publish "
@@ -483,23 +490,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "aggregate_records",
             "description": (
-                "Compute a deterministic aggregate (share, mean, count, sum) over ONE "
-                "locality's own NEIGHBORHOODS, optionally restricted to a category. This "
-                "is the tool for single-locality statistics like 'what share of Tel "
-                "Aviv's neighborhoods are above the city median price?' — that is NOT a "
-                "ranking question, so do not use compare_items for it. Only priced "
-                "neighborhoods are counted in the numerator AND denominator here — a "
-                "locality can have neighborhoods nadlan.gov.il tracks but never priced, "
-                "and this tool reports that count honestly (see "
-                "'neighborhoods_without_price_data') rather than pretending the priced "
-                "subset is the whole picture. The 'category' argument must be one of the "
-                "dataset's OWN category values, not the user's phrasing: call with no "
-                "category first to see 'known_categories' and 'category_semantics', then "
-                "call again with a real one. If 'unknown_category' comes back true you "
-                "asked for something that does not exist — that is NOT a zero result and "
-                "you must never report it as 0%. Always relay 'category_semantics'. "
-                "'share' is computed on units (a share BY COUNT of neighborhoods); the "
-                "record counts are returned too. Never compute a percentage yourself."
+                "Compute a deterministic aggregate (share, count) over ONE locality's "
+                "own NEIGHBORHOODS, optionally restricted to a category. This is the "
+                "tool for single-locality statistics like 'what share of Tel Aviv's "
+                "neighborhoods are above the city median price?' — that is NOT a "
+                "ranking question, so do not use compare_items for it. 'mean' and "
+                "'sum' are NOT offered here: every neighborhood record is a single "
+                "unit, so a mean would always be 1.0 and a sum would just restate the "
+                "count — neither means anything. Only priced neighborhoods are counted "
+                "in the numerator AND denominator here — a locality can have "
+                "neighborhoods nadlan.gov.il tracks but never priced, and this tool "
+                "reports that count honestly (see 'neighborhoods_without_price_data') "
+                "rather than pretending the priced subset is the whole picture. The "
+                "'category' argument must be one of the dataset's OWN category values, "
+                "not the user's phrasing: call with no category first to see "
+                "'known_categories' and 'category_semantics', then call again with a "
+                "real one. If 'unknown_category' comes back true you asked for "
+                "something that does not exist — that is NOT a zero result and you "
+                "must never report it as 0%. Always relay 'category_semantics'. "
+                "'share' is a share BY COUNT of neighborhoods; the raw counts are "
+                "returned too. Never compute a percentage yourself."
             ),
             "parameters": {
                 "type": "object",
@@ -731,6 +741,7 @@ def _gate_ids(item_ids: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
             continue
         row = dataset.NEIGHBORHOODS[item_id]
         parent_id = row.get("parent_id")
+        assert parent_id is not None, f"data invariant violated: neighborhood {item_id!r} has no parent_id"
         parent_name = dataset.LOCALITIES.get(parent_id, {}).get("name_en", parent_id)
         ineligible.append(
             {
@@ -1054,7 +1065,7 @@ def resolve_entity(query: str) -> dict[str, Any]:
     }
 
 
-def find_items(filters: dict[str, str]) -> dict[str, Any]:
+def find_items(filters: dict[str, str | int | float | bool]) -> dict[str, Any]:
     """Attribute filter -> matching locality ids. Also returns the
     attribute keys that actually exist, so an unknown field reads as
     "there is no such field" rather than as "nothing matched" — those are
@@ -1876,7 +1887,7 @@ def get_current_mortgage_rates() -> dict[str, Any]:
 # Dispatch table used by agent_loop.py: tool name -> callable(args_dict).
 # Kept as a plain dict, not a decorator/registry framework — this is the
 # entire "tool registry" a hand-rolled loop needs.
-def _find_items_filters(args: dict[str, Any]) -> dict[str, str]:
+def _find_items_filters(args: dict[str, Any]) -> dict[str, str | int | float | bool]:
     """Normalize find_items' arguments. Three shapes arrive in practice
     and they do NOT mean the same thing — carried over verbatim from the
     prior build, which found this live on its own first eval question:

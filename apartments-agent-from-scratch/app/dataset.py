@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from app.entity_resolution import resolve as _resolve_entity
-from app.hebrew import REGION_GROUPS, TRANSLITERATION_VARIANTS, match_region
+from app.hebrew import REGION_GROUPS, TRANSLITERATION_VARIANTS, match_region  # noqa: F401 -- REGION_GROUPS re-exported as dataset.REGION_GROUPS, part of this module's public API (see docs/ARCHITECTURE.md)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "processed_data"
 

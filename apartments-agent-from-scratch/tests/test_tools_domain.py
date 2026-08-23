@@ -276,6 +276,15 @@ def test_compare_items_tie_and_missing_field_renormalization_on_the_real_leaderb
 
     judeide = next(r for r in result["ranking"] if r["item_id"] == JUDEIDE_MAKER)
     assert judeide["total_score"] == pytest.approx(0.7245, abs=1e-4)
+
+    # The docstring's claim, made checkable rather than just asserted in
+    # prose: this pair is non-decisive BECAUSE the real score gap is
+    # inside DECISIVE_SCORE_GAP, not for some other reason. Without this,
+    # `decisive is False` above only pins the OUTCOME — if
+    # DECISIVE_SCORE_GAP were ever tightened enough that 0.0012 no longer
+    # qualified as a tie, this test would keep passing on stale reasoning.
+    real_gap = result["ranking"][0]["total_score"] - judeide["total_score"]
+    assert real_gap < DECISIVE_SCORE_GAP
     assert judeide["covered_weight"] == pytest.approx(0.85)
     assert judeide["missing_criteria"] == ["rental_yield"]
     assert len(judeide["components"]) == 4  # rental_yield dropped, not scored as 0

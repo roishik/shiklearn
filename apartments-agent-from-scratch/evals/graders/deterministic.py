@@ -15,7 +15,7 @@ their pass/fail.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from evals.types import GradeResult, Grader, Outcome, Task
 
@@ -331,7 +331,7 @@ class NoFabricatedNumbersGrader(Grader):
     def __init__(self, tolerance: float = 1e-4):
         self.tolerance = tolerance
 
-    def _is_traceable(self, n: float, pool: list[float]) -> bool:
+    def _is_traceable(self, n: float, pool: Sequence[float]) -> bool:
         return any(abs(n - p) <= max(self.tolerance, abs(p) * self.tolerance) for p in pool)
 
     def grade(self, task: Task, outcome: Outcome) -> GradeResult:

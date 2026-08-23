@@ -263,6 +263,16 @@ def build_summary(
             "not just #1).\n"
         )
 
+    # weight_robustness_report's OWN verdict, quoted rather than
+    # recomputed -- app.tools already picks out the single tightest flip
+    # point (most_sensitive_criterion) and states it in one sentence
+    # (summary). Restating that in the model's own words here, instead of
+    # only in the per-criterion table above, is the same discipline this
+    # whole project applies to the agent itself: the tool computes the
+    # verdict, prose quotes it, nothing upstream re-derives it a second,
+    # possibly-diverging way.
+    lines.append(f"By `weight_robustness_report`'s own account: {robustness['summary']}\n")
+
     # Average tau across the fixed +-50% probe, both directions, all criteria.
     all_tau = [v["down"]["kendall_tau"] for v in fixed_probe.values()] + [
         v["up"]["kendall_tau"] for v in fixed_probe.values()

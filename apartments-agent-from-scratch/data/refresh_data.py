@@ -376,7 +376,16 @@ def _fetch_bytes_with_retry(url: str) -> bytes:
                 last_exc = exc
                 continue
             raise
-    raise last_exc  # pragma: no cover -- loop always returns or raises
+    # Unreachable with MAX_RETRIES >= 1 (the last iteration always
+    # returns or re-raises, never falls through to here) -- but
+    # `raise last_exc` when last_exc is still None (MAX_RETRIES == 0,
+    # or a future edit to the loop above) would raise a confusing
+    # `TypeError: exceptions must derive from BaseException` instead of
+    # a message that says what actually happened.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"fetch({url!r}) exhausted MAX_RETRIES={MAX_RETRIES} "
+                       "without a response or a captured exception")  # pragma: no cover
 
 
 def _cached_json(url: str, dest_path: Path, *, force: bool = False) -> tuple[dict | None, bool, str | None]:
@@ -506,7 +515,13 @@ def select_candidates(setl_types: dict[str, dict]) -> tuple[dict[str, dict], Cou
     candidates: dict[str, dict] = {}
     excluded: Counter = Counter()
     for code, record in setl_types.items():
-        global_type = record.get("GLOBAL_TYPE")
+        # GLOBAL_TYPE is normally a string, but setl_types.json is
+        # untrusted external JSON -- one real locality in the live feed
+        # (2026-08-20 snapshot) carries GLOBAL_TYPE=null, which is why
+        # this coerces explicitly rather than trusting the field's type.
+        # str(None) -> "None" still produces an informative, distinct
+        # excluded_by_reason bucket rather than crashing the dict lookup.
+        global_type = str(record.get("GLOBAL_TYPE"))
         population = _population_of(record)
         if global_type not in ELIGIBLE_GLOBAL_TYPES:
             reason = EXCLUDED_TYPE_REASONS.get(global_type, f"excluded_global_type:{global_type}")
@@ -673,6 +688,33 @@ def _fetch_xlsx_cached(url: str, dest_path: Path) -> Path:
     raise RuntimeError(f"failed to fetch {url} after {MAX_RETRIES} attempts: {last_exc}")
 
 
+def _xlsx_numeric(value: object, *, sheet: str, row: int, field: str) -> float | int | None:
+    """Coerce ONE openpyxl cell value to a number, or None -- never raise.
+
+    openpyxl's cell .value can be bool/float/Decimal/str/CellRichText/
+    datetime/date/time/timedelta/a formula object, not just "a number or
+    None" the way the two callers below used to assume (a bare `float(x)`
+    /`int(x)` on whatever the cell held). Every real cell in the current
+    CBS releases IS clean (verified by scanning every data row of both
+    sheets before this landed), so this has never actually fired -- but
+    "never" is a claim about the CURRENT file, and this pipeline re-reads
+    a THIRD-PARTY spreadsheet that gets re-published periodically. A
+    stray footnote marker or a "-" for a suppressed small-population cell
+    in a future release should not crash the whole refresh on one field of
+    one row; it should drop that one field, exactly like a genuinely blank
+    cell already does, and say so loudly rather than silently.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool is an int subclass; not a real number here
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    print(f"    WARNING: {sheet} row {row}, {field}: expected a number, got "
+          f"{type(value).__name__} {value!r} -- treating as absent, not a real value.")
+    return None
+
+
 def parse_cbs_socioeconomic_2021(xlsx_path: Path) -> dict[str, dict]:
     """Parses cbs_socio_2021.xlsx, sheet CBS_SOCIO_2021_SHEET, data
     starting at row CBS_SOCIO_2021_DATA_START_ROW. Column mapping (verified
@@ -702,6 +744,11 @@ def parse_cbs_socioeconomic_2021(xlsx_path: Path) -> dict[str, dict]:
         years_schooling = ws.cell(row=r, column=17).value
         pct_academic = ws.cell(row=r, column=20).value
         income_pc = ws.cell(row=r, column=38).value
+        index_value = _xlsx_numeric(index_value, sheet="cbs_socio_2021", row=r, field="index_value")
+        cluster = _xlsx_numeric(cluster, sheet="cbs_socio_2021", row=r, field="cluster")
+        years_schooling = _xlsx_numeric(years_schooling, sheet="cbs_socio_2021", row=r, field="years_schooling")
+        pct_academic = _xlsx_numeric(pct_academic, sheet="cbs_socio_2021", row=r, field="pct_academic")
+        income_pc = _xlsx_numeric(income_pc, sheet="cbs_socio_2021", row=r, field="income_pc")
         if index_value is not None:
             rec["socioeconomic_index_value"] = float(index_value)
         if cluster is not None:
@@ -745,6 +792,7 @@ def parse_cbs_peripherality_2020(xlsx_path: Path) -> dict[str, dict]:
             rec["name_en_raw"] = str(name_en_raw).strip()
         if subdistrict is not None:
             rec["subdistrict"] = int(subdistrict) if isinstance(subdistrict, (int, float)) else subdistrict
+        periph = _xlsx_numeric(periph, sheet="cbs_peripherality_2020", row=r, field="peripherality_index_2020")
         if periph is not None:
             rec["peripherality_index_2020"] = float(periph)
         out[code] = rec
@@ -1017,7 +1065,14 @@ def build_datasets(force: bool = False) -> None:
                 "excluded_by_reason": dict(excluded_by_type_or_pop),
             },
             "join_coverage": {
+                # All four join fields reported here, not just the one with
+                # a real gap -- a dataset's own metadata should be able to
+                # confirm every coverage number quoted in the project's
+                # docs, not just the one that happens to need an excuse.
                 "socioeconomic_cluster": f"{ses_hits} of {len(eligible)}",
+                "peripherality_index_2020": f"{periph_hits} of {len(eligible)}",
+                "name_en": f"{name_en_hits} of {len(eligible)}",
+                "household_size": f"{household_hits} of {len(eligible)}",
             },
             "known_limitations": [
                 "Per-transaction deal data is not obtainable: the legacy "
@@ -1123,7 +1178,8 @@ def print_verification(force: bool = False) -> None:
 
     print("\n=== VERIFICATION ===")
     print(f"eligible localities: {meta['counts']['eligible']}")
-    print(f"socioeconomic_cluster join coverage: {meta['join_coverage']['socioeconomic_cluster']}")
+    for field, coverage in meta["join_coverage"].items():
+        print(f"{field} join coverage: {coverage}")
 
     nbr_path = PROCESSED_DIR / "neighborhoods.json"
     if nbr_path.exists():
