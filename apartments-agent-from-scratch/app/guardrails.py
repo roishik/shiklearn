@@ -51,6 +51,28 @@ _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"</?untrusted_data", re.I),
     re.compile(r"do anything now", re.I),
     re.compile(r"pretend (you are|to be) (an? )?(ai )?(with no|without) (restrictions|rules|guardrails)", re.I),
+    # Hebrew equivalents of the highest-value patterns above. This project
+    # treats Hebrew as a first-class input language throughout (see
+    # app/hebrew.py, the RTL UI work) -- an injection scanner that only
+    # recognizes these phrasings in English would have ZERO coverage for
+    # exactly the language this agent is built to accept, which is a real
+    # gap, not the same kind of "misses clever paraphrasing" limitation
+    # the module docstring already discloses. Literal common phrasings
+    # only, same scope and same honesty about that scope as the English
+    # list above -- Hebrew's prefix morphology (ה-/ל-/מ-/ו-/ש-/כ- attach
+    # directly to the next word) and verb-conjugation-by-gender make an
+    # exhaustive regex impractical here just as it is in English; this
+    # catches what someone would actually type, not everything they could.
+    re.compile(r"התעלם מ.{0,15}הוראות ה?קודמות", re.I),  # "ignore the previous instructions"
+    # {0,20} rather than {0,10}: "the system's prompt" is naturally phrased
+    # "...של המערכת" (prompt OF the system) in Hebrew, not as a tight
+    # compound the way English says "system prompt" -- a narrower gap
+    # missed this real, natural phrasing in testing.
+    re.compile(r"חשוף.{0,20}(פרומפט|הנחיות).{0,10}מערכת", re.I),  # "reveal the system's prompt/instructions"
+    re.compile(r"הצג.{0,20}(פרומפט|הנחיות).{0,10}מערכת", re.I),  # "show/print the system's prompt"
+    re.compile(r"את[ה]? (כעת|עכשיו) במצב (מפתח|דיבוג|מפתחים)", re.I),  # "you are now in developer/debug mode"
+    re.compile(r"הוראות חדשות\s*:", re.I),  # "new instructions:"
+    re.compile(r"התחזה ל.{0,20}(ללא|בלי) (הגבלות|כללים)", re.I),  # "pretend to be ... without restrictions/rules"
 ]
 
 
