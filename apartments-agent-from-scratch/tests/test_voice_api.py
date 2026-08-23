@@ -35,8 +35,20 @@ def client():
 
 @pytest.fixture
 def voice_available(monkeypatch):
-    """Make the credential check pass without any real key present."""
+    """Make every credential check pass without any real key present.
+
+    Three functions, not one: _missing_credential() is the COMBINED
+    check /voice/health uses (needs STT and TTS both), while
+    /voice/transcribe and /voice/speak each call only their own scoped
+    half (_missing_stt_credential / _missing_tts_credential) — see
+    app/voice_api.py's docstring on _missing_credential for why calling
+    the combined check from either single-capability endpoint was a
+    real bug. A fixture claiming "voice is available" has to make all
+    three agree, or tests using it would silently stop covering the
+    endpoints they claim to."""
     monkeypatch.setattr(voice_api, "_missing_credential", lambda: None)
+    monkeypatch.setattr(voice_api, "_missing_stt_credential", lambda: None)
+    monkeypatch.setattr(voice_api, "_missing_tts_credential", lambda: None)
 
 
 class FakeSTT:
@@ -119,9 +131,41 @@ def test_health_never_500s_without_credentials(client, monkeypatch):
 
 
 def test_endpoints_refuse_politely_when_unconfigured(client, monkeypatch):
-    monkeypatch.setattr(voice_api, "_missing_credential", lambda: "OPENAI_API_KEY is not set.")
+    # Each endpoint's OWN scoped check, not the combined one -- see the
+    # voice_available fixture's docstring. Patching only
+    # _missing_credential here would have zero effect on either endpoint
+    # and this test would pass for the wrong reason (the real, unpatched
+    # checks happening to also fail in a keyless test environment).
+    monkeypatch.setattr(voice_api, "_missing_stt_credential", lambda: "OPENAI_API_KEY is not set.")
+    monkeypatch.setattr(voice_api, "_missing_tts_credential", lambda: "OPENAI_API_KEY is not set.")
     assert client.post("/voice/transcribe", content=TINY_WAV, headers={"Content-Type": "audio/wav"}).status_code == 503
     assert client.post("/voice/speak", json={"text": "hello"}).status_code == 503
+
+
+def test_speak_works_when_only_stt_is_misconfigured(client, monkeypatch, fake_tts):
+    """The real bug this pins: /voice/speak is a TEXT-TO-SPEECH endpoint
+    and must not care whether speech-to-TEXT is configured. Before
+    app/voice_api.py split _missing_credential() into per-capability
+    halves, both /voice/transcribe and /voice/speak called the same
+    combined check, which looked at STT first — so a locality with
+    TTS_PROVIDER=google fully configured and working, but no
+    OPENAI_API_KEY for STT, got /voice/speak wrongly 503ing and blaming
+    speech-to-text for a request that never touched it."""
+    monkeypatch.setattr(voice_api, "_missing_stt_credential", lambda: "OPENAI_API_KEY is not set — speech-to-text needs it.")
+    monkeypatch.setattr(voice_api, "_missing_tts_credential", lambda: None)
+    resp = client.post("/voice/speak", json={"text": "hello"})
+    assert resp.status_code == 200
+
+
+def test_transcribe_stays_blocked_when_only_stt_is_misconfigured(client, monkeypatch, fake_stt):
+    """The mirror case: /voice/transcribe must still correctly refuse when
+    STT itself (the capability it actually uses) is unconfigured, even if
+    TTS happens to be fine — confirms the split didn't just move the bug
+    from over-blocking to under-blocking."""
+    monkeypatch.setattr(voice_api, "_missing_stt_credential", lambda: "OPENAI_API_KEY is not set — speech-to-text needs it.")
+    monkeypatch.setattr(voice_api, "_missing_tts_credential", lambda: None)
+    resp = client.post("/voice/transcribe", content=TINY_WAV, headers={"Content-Type": "audio/wav"})
+    assert resp.status_code == 503
 
 
 # ── Transcription ──────────────────────────────────────────────────────

@@ -83,18 +83,40 @@ class InterruptRequest(BaseModel):
     spoken_prefix: str = Field(default="", max_length=TTS_MAX_CHARS)
 
 
-def _missing_credential() -> str | None:
-    """Why voice is unavailable, in a sentence a reviewer can act on, or
-    None if it is available. Checked without constructing a provider,
-    because constructing one raises and this is the endpoint whose whole
-    job is to answer the question calmly."""
+def _missing_stt_credential() -> str | None:
+    """Why SPEECH-TO-text is unavailable, or None if it is available.
+    Checked without constructing a provider, because constructing one
+    raises and this is the endpoint whose whole job is to answer the
+    question calmly."""
     if STT_PROVIDER == "openai" and not have_openai_key():
         return "OPENAI_API_KEY is not set — speech-to-text needs it."
+    return None
+
+
+def _missing_tts_credential() -> str | None:
+    """Why text-to-SPEECH is unavailable, or None if it is available."""
     if TTS_PROVIDER == "openai" and not have_openai_key():
         return "OPENAI_API_KEY is not set — text-to-speech needs it."
     if TTS_PROVIDER == "google" and not have_gcp_tts_key():
         return "GCP_TTS_API_KEY is not set — TTS_PROVIDER is 'google'."
     return None
+
+
+def _missing_credential() -> str | None:
+    """Why voice conversation mode as a WHOLE is unavailable (STT and TTS
+    both required for a round trip), or None if both are available.
+
+    Only for /voice/health, which genuinely needs the combined answer for
+    the single "start a spoken conversation" control. /voice/transcribe
+    and /voice/speak each need ONLY their own half -- calling this
+    combined check from either one was a real bug: with STT_PROVIDER
+    misconfigured but TTS_PROVIDER fully configured and working (e.g.
+    TTS_PROVIDER=google with a real GCP_TTS_API_KEY, but no
+    OPENAI_API_KEY for STT), /voice/speak would 503 and claim
+    "speech-to-text needs it" -- rejecting a request that had nothing to
+    do with speech-to-text, for a capability that endpoint doesn't use.
+    """
+    return _missing_stt_credential() or _missing_tts_credential()
 
 
 @router.get("/health")
@@ -126,7 +148,7 @@ async def transcribe(request: Request) -> dict:
     exactly one file per request that has no accompanying fields — the
     content type header already says everything the form would have.
     """
-    reason = _missing_credential()
+    reason = _missing_stt_credential()
     if reason is not None:
         raise HTTPException(status_code=503, detail=reason)
 
@@ -188,7 +210,7 @@ async def speak(req: SpeakRequest) -> Response:
     to "what the user heard" if the units that were played match the
     units that were requested. See app/conversation.py.
     """
-    reason = _missing_credential()
+    reason = _missing_tts_credential()
     if reason is not None:
         raise HTTPException(status_code=503, detail=reason)
 
