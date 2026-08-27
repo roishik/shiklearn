@@ -1,6 +1,0 @@
--r requirements.txt
-pytest>=8.0
-# Data ingestion only (data/refresh_data.py reads published .xlsx releases).
-# NOT needed to run the agent — the app reads derived JSON from
-# data/processed_data/.
-openpyxl>=3.1

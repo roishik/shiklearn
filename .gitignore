@@ -4,4 +4,10 @@ How to Install XAMPP and WordPress Locally on Windows PC_files/
 *.lnk
 .DS_Store
 
-# Project-level ignores are in apartments-agent-from-scratch/.gitignore
+# apartments-agent-from-scratch is now its OWN standalone repo, living
+# nested inside this folder locally:
+#   https://github.com/roishik/apartments-agent-from-scratch
+# It is ignored here so the code is never duplicated across two GitHub
+# repos and never tracked as a stray gitlink. Work on it from inside
+# that folder, which has its own .git and its own remote.
+apartments-agent-from-scratch/
