@@ -11,3 +11,7 @@ How to Install XAMPP and WordPress Locally on Windows PC_files/
 # repos and never tracked as a stray gitlink. Work on it from inside
 # that folder, which has its own .git and its own remote.
 apartments-agent-from-scratch/
+
+# Same for data-gatekeeper-agent:
+#   https://github.com/roishik/data-gatekeeper-agent
+data-gatekeeper-agent/
